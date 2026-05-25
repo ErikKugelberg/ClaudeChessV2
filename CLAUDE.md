@@ -10,7 +10,7 @@ python botFighter.py
 python botFighter.py --games 20 --time-limit 0.5
 
 # GUI viewer: watch bots play or play against bot2 interactively
-python botWatch.py
+python chessViewer.py
 ```
 
 Both scripts require `matplotlib`, `numpy`, and standard library only.
@@ -54,7 +54,7 @@ During a bot-vs-bot game, each bot independently tracks the full position. After
 
 CLI script that runs N games with alternating colors (bot1=white on odd games) and writes structured per-move logs. Access internal stats via `bot.i` and `bot.prunings` as public attributes — `botMove()` itself returns only a 4-tuple.
 
-### GUI — `botWatch.py`
+### GUI — `chessViewer.py`
 
 `boardManager` wraps a matplotlib figure. Board coordinates: visual `(x,y)` maps to board `(bx,by)` based on `playWhite` orientation flag. Two modes selected at startup:
 - **Mode 1** (bot-vs-bot): infinite loop with `plt.pause()` between moves

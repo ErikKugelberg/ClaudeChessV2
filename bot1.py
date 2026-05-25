@@ -262,7 +262,7 @@ class chessBoard1:
         self.avgMoveTime += (time.time() - startTime)
         self.avgMoveTime /= IIR
         self.avgMoveTime = np.round(self.avgMoveTime, decimals=1)
-        print("White: ", self.whitesMove, "Positions: ", self.i, "  Prunings: ", self.prunings, "Depth: ", d, "LookUps: ", self.lookUps)
+        print(f"\033[34mBot1 | {'White' if self.whitesMove else 'Black'} | Positions: {self.i}  Prunings: {self.prunings}  Depth: {d}  LookUps: {self.lookUps}\033[0m")
 
         if move != None:
             self.makeMove(move, frfr=True)

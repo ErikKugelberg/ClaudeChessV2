@@ -35,10 +35,10 @@ class boardManager:
         self.board = [0] * 64
         self.playWhite = True       # board orientation
         self.avgMoveTime = 0
-        self.wDepth = 0
-        self.bDepth = 0
-        self.wEvaluation = 0
-        self.bEvaluation = 0
+        self.bot1Depth = 0
+        self.bot2Depth = 0
+        self.bot1Evaluation = 0
+        self.bot2Evaluation = 0
         self.bot1Wins = 0
         self.bot2Wins = 0
         self.draws = 0
@@ -76,22 +76,24 @@ class boardManager:
             plt.text(8.1, 7.0, "Your Wins: " + str(self.bot1Wins),                                  fontsize=10, color='blue')
             plt.text(8.1, 6.0, "Draws:     " + str(self.draws),                                     fontsize=10, color='black')
             plt.text(8.1, 5.0, "Bot Wins:  " + str(self.bot2Wins),                                  fontsize=10, color='red')
-            plt.text(8.1, 3.5, "Bot Eval:  " + str(np.round(self.bEvaluation/100, decimals=1)),     fontsize=10, color='red')
-            plt.text(8.1, 3.0, "Bot Depth: " + str(self.bDepth),                                    fontsize=10, color='red')
+            plt.text(8.1, 3.5, "Bot Eval:  " + str(np.round(self.bot2Evaluation/100, decimals=1)),  fontsize=10, color='red')
+            plt.text(8.1, 3.0, "Bot Depth: " + str(self.bot2Depth),                                 fontsize=10, color='red')
             plt.text(8.1, 2.5, "Time:      " + str(self.avgMoveTime),                               fontsize=10, color='red')
         else:
             plt.text(8.1, 7.5, f"Game {self.gameNum}",                                              fontsize=10, color='black')
-            plt.text(8.1, 7.0, f"W={self.whiteLabel}  B={self.blackLabel}",                         fontsize=9,  color='black')
-            plt.text(8.1, 6.0, f"Bot2 Wins: {self.bot2Wins}",                                       fontsize=10, color='red')
-            plt.text(8.1, 5.0, f"B Eval:    {np.round(self.bEvaluation/100, decimals=1)}",          fontsize=10, color='red')
-            plt.text(8.1, 4.5, f"B Depth:   {self.bDepth}",                                         fontsize=10, color='red')
-            plt.text(8.1, 4.0, f"Time:      {self.avgMoveTime}",                                    fontsize=10, color='red')
-            plt.text(8.1, 3.5, f"Draws:     {self.draws}",                                          fontsize=10, color='red')
-            plt.text(8.1, 3.0, f"W Depth:   {self.wDepth}",                                         fontsize=10, color='red')
-            plt.text(8.1, 2.5, f"W Eval:    {np.round(self.wEvaluation/100, decimals=1)}",          fontsize=10, color='red')
-            plt.text(8.1, 1.5, f"Bot1 Wins: {self.bot1Wins}",                                       fontsize=10, color='red')
+            plt.text(8.1, 7.1, f"White: {self.whiteLabel}",                                         fontsize=9,  color='black')
+            plt.text(8.1, 6.8, f"Black: {self.blackLabel}",                                         fontsize=9,  color='black')
+            plt.text(8.1, 6.2, f"Bot1 Wins:  {self.bot1Wins}",                                      fontsize=10, color='blue')
+            plt.text(8.1, 5.7, f"Bot1 Eval:  {np.round(self.bot1Evaluation/100, decimals=1)}",      fontsize=10, color='blue')
+            plt.text(8.1, 5.2, f"Bot1 Depth: {self.bot1Depth}",                                     fontsize=10, color='blue')
+            plt.text(8.1, 4.4, f"Bot2 Wins:  {self.bot2Wins}",                                      fontsize=10, color='red')
+            plt.text(8.1, 3.9, f"Bot2 Eval:  {np.round(self.bot2Evaluation/100, decimals=1)}",      fontsize=10, color='red')
+            plt.text(8.1, 3.4, f"Bot2 Depth: {self.bot2Depth}",                                     fontsize=10, color='red')
+            plt.text(8.1, 2.5, f"Draws:      {self.draws}",                                         fontsize=10, color='black')
+            plt.text(8.1, 2.0, f"Time:       {self.avgMoveTime}",                                   fontsize=10, color='black')
 
-        self.ax.set_xlim(0, 10)
+        self.ax.add_patch(plt.Rectangle((0, 0), 8, 8, fill=False, edgecolor='black', linewidth=2, zorder=5))
+        self.ax.set_xlim(0, 11)
         self.ax.set_ylim(0, 8)
         self.ax.set_xticks([])
         self.ax.set_yticks([])
@@ -178,8 +180,8 @@ class boardManager:
                 self._bot_thinking = True
                 bot_move, depth, elapsed, evaluation = self._sp_bot.botMove(depthLimit=99, timeLimit=TIME_LIMIT)
                 self._bot_thinking = False
-                self.bDepth = depth
-                self.bEvaluation = evaluation
+                self.bot2Depth = depth
+                self.bot2Evaluation = evaluation
                 self.avgMoveTime = elapsed
 
                 if bot_move is None:
@@ -243,8 +245,8 @@ class boardManager:
         self._bot_thinking = True
         bot_move, depth, elapsed, evaluation = self._sp_bot.botMove(depthLimit=99, timeLimit=TIME_LIMIT)
         self._bot_thinking = False
-        self.bDepth = depth
-        self.bEvaluation = evaluation
+        self.bot2Depth = depth
+        self.bot2Evaluation = evaluation
         self.avgMoveTime = elapsed
         if bot_move is not None:
             self.setPosition(self._sp_bot.getPosition(), [bot_move.getX2(), bot_move.getY2()])
@@ -255,7 +257,7 @@ class boardManager:
 # Mode selection
 # ---------------------------------------------------------------------------
 
-print("=== botWatch ===")
+print("=== chessViewer ===")
 print("  1) Bot1 vs Bot2  (watch)")
 print("  2) Play vs Bot2  (interactive)")
 mode = input("Select mode [1/2]: ").strip()
@@ -312,8 +314,10 @@ else:
         while True:
             move, depth, elapsed, evaluation = white_bot.botMove(depthLimit=99, timeLimit=TIME_LIMIT)
             BM.avgMoveTime = elapsed
-            BM.wDepth = depth
-            BM.wEvaluation = evaluation
+            if bot1_plays_white:
+                BM.bot1Depth = depth; BM.bot1Evaluation = evaluation
+            else:
+                BM.bot2Depth = depth; BM.bot2Evaluation = evaluation
             if move is None:
                 BM.bot2Wins += 1 if bot1_plays_white else 0
                 BM.bot1Wins += 1 if not bot1_plays_white else 0
@@ -328,8 +332,10 @@ else:
 
             move, depth, elapsed, evaluation = black_bot.botMove(depthLimit=99, timeLimit=TIME_LIMIT)
             BM.avgMoveTime = elapsed
-            BM.bDepth = depth
-            BM.bEvaluation = evaluation
+            if bot1_plays_white:
+                BM.bot2Depth = depth; BM.bot2Evaluation = evaluation
+            else:
+                BM.bot1Depth = depth; BM.bot1Evaluation = evaluation
             if move is None:
                 BM.bot1Wins += 1 if bot1_plays_white else 0
                 BM.bot2Wins += 1 if not bot1_plays_white else 0

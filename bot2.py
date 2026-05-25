@@ -107,7 +107,8 @@ class chessBoard2:
         self.i = 0
         self.avgMoveTime = 0
         self.prunings = 0
-        self.boardLookupMap = LimitedSizeDict(max_size=15600) # n*64=1 000 000 , 1MB
+        self.boardLookupMap = LimitedSizeDict(max_size=15600)
+        self._ttable = LimitedSizeDict(max_size=100_000)
         self.lookUps = 0
         self.avgPositionsEvaluated = 0
         self.whiteKingPos = [4, 0]
@@ -276,7 +277,7 @@ class chessBoard2:
         self.avgMoveTime += (time.time() - startTime)
         self.avgMoveTime /= IIR
         self.avgMoveTime = np.round(self.avgMoveTime, decimals=1)
-        print("White: ", self.whitesMove, "Positions: ", self.i, "  Prunings: ", self.prunings, "Depth: ", d, "LookUps: ", self.lookUps)
+        print(f"\033[31mBot2 | {'White' if self.whitesMove else 'Black'} | Positions: {self.i}  Prunings: {self.prunings}  Depth: {d}  LookUps: {self.lookUps}\033[0m")
 
         if move != None:
             self.makeMove(move, frfr=True)
@@ -453,71 +454,86 @@ class chessBoard2:
 
     # Returns the best eval of a certain move, given the following moves
     def _recFindBestEval(self, depth, alpha, beta, whiteIsAnalyising, timeLimit, startTime):
+        entry_depth = depth
+
+        # Transposition table lookup — key encodes full game state, not just pieces
+        ttKey = (self._toString(self.board), self.whitesMove, self.rkMoved, self.enPas[0], self.enPas[1])
+        if self._ttable.containsKey(ttKey):
+            stored_depth, stored_eval = self._ttable[ttKey]
+            if stored_depth >= entry_depth:
+                self.lookUps += 1
+                return stored_eval
+
         if depth == 0:
             self.i += 1
-            return self.evaluatePosition()
+            eval_val = self.evaluatePosition()
+            self._ttable[ttKey] = (0, eval_val)
+            return eval_val
+
+        if self.whitesMove:
+            bestEval = -float('inf')
         else:
-            if self.whitesMove:
-                bestEval = -float('inf')
+            bestEval = float('inf')
+        remaining = depth - 1
+        moves = self.getLegalMoves()
+
+        if len(moves) == 0:
+            if self._kingChecked(checkWhiteKing=self.whitesMove):
+                return bestEval # checkmate
             else:
-                bestEval = float('inf')
-            depth -= 1 
-            moves = self.getLegalMoves()
+                return 0 # stalemate
 
-            if len(moves) == 0:
-                if self._kingChecked(checkWhiteKing=self.whitesMove):
-                    return bestEval # We lose
-                else:
-                    return 0 # Stalemate
+        storeWhitesMove = self.whitesMove
 
-            storeWhitesMove = self.whitesMove
+        # Sort moves to be best first
+        if remaining != 0:
+            moves = self._sortMoves(moves, storeWhitesMove)
+        else:
+            newMoves = [move for move in moves if move.getAttacking() == 1]
+            if len(newMoves) != 0:
+                moves = newMoves
 
-            # Sort moves to be best first
-            if depth != 0:
-                moves = self._sortMoves(moves, storeWhitesMove)
-            else:
-                newMoves = [move for move in moves if move.getAttacking() == 1]
-                if len(newMoves) != 0:
-                    moves = newMoves
-
-            for move in moves:
-                rec = self._saveState(move)
-                self.makeMove(move)
-                if (self.boardHistory.count(self._toString(self.board)) > 2):
-                    self.prunings += 1
-                    self._undoMove(rec)
-                    return 0 # Draw by repetition
-                # self.whitesMove matches board state but the inverse should be analysed
-                evaluation = self._recFindBestEval(depth, alpha, beta, whiteIsAnalyising, timeLimit=timeLimit, startTime=startTime)
-
-                # Stop, if time ran out
-                if (time.time() - startTime) > timeLimit:
-                    self._undoMove(rec)
-                    if whiteIsAnalyising:
-                        return -float('inf')
-                    else:
-                        return float('inf')
-
-                if storeWhitesMove:
-                    bestEval = max(evaluation, bestEval)
-                    alpha = max(evaluation, alpha)
-                    if beta <= alpha:
-                        self.prunings += 1
-                        if move.getAttacking() == 0:
-                            self._history[move.getX1() + move.getY1()*8][move.getX2() + move.getY2()*8] += (depth + 1) * (depth + 1)
-                        self._undoMove(rec)
-                        return bestEval
-                else:
-                    bestEval = min(evaluation, bestEval)
-                    beta = min(evaluation, beta)
-                    if beta <= alpha:
-                        self.prunings += 1
-                        if move.getAttacking() == 0:
-                            self._history[move.getX1() + move.getY1()*8][move.getX2() + move.getY2()*8] += (depth + 1) * (depth + 1)
-                        self._undoMove(rec)
-                        return bestEval
+        for move in moves:
+            rec = self._saveState(move)
+            self.makeMove(move)
+            if (self.boardHistory.count(self._toString(self.board)) > 2):
+                self.prunings += 1
                 self._undoMove(rec)
-            return bestEval
+                return 0 # Draw by repetition — don't cache (depends on game history)
+            evaluation = self._recFindBestEval(remaining, alpha, beta, whiteIsAnalyising, timeLimit=timeLimit, startTime=startTime)
+
+            # Stop if time ran out
+            if (time.time() - startTime) > timeLimit:
+                self._undoMove(rec)
+                if whiteIsAnalyising:
+                    return -float('inf')
+                else:
+                    return float('inf')
+
+            if storeWhitesMove:
+                bestEval = max(evaluation, bestEval)
+                alpha = max(evaluation, alpha)
+                if beta <= alpha:
+                    self.prunings += 1
+                    if move.getAttacking() == 0:
+                        self._history[move.getX1() + move.getY1()*8][move.getX2() + move.getY2()*8] += entry_depth * entry_depth
+                    self._undoMove(rec)
+                    self._ttable[ttKey] = (entry_depth, bestEval)
+                    return bestEval
+            else:
+                bestEval = min(evaluation, bestEval)
+                beta = min(evaluation, beta)
+                if beta <= alpha:
+                    self.prunings += 1
+                    if move.getAttacking() == 0:
+                        self._history[move.getX1() + move.getY1()*8][move.getX2() + move.getY2()*8] += entry_depth * entry_depth
+                    self._undoMove(rec)
+                    self._ttable[ttKey] = (entry_depth, bestEval)
+                    return bestEval
+            self._undoMove(rec)
+
+        self._ttable[ttKey] = (entry_depth, bestEval)
+        return bestEval
 
     # Moves the pieces, but doesn't update things like en Passant, board history and rokad logic
     def _movePieces(self, move):
