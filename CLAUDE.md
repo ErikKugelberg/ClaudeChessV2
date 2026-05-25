@@ -5,9 +5,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Running the Project
 
 ```powershell
-# Automated benchmark: bot1 vs bot2, logs to logs/benchmark_<timestamp>.log
-python botFighter.py
-python botFighter.py --games 20 --time-limit 0.5
+# Standard benchmark: 10 games, 0.5s per move — use this for all bot2 evaluations
+python botFighter.py --games 10 --time-limit 0.5
 
 # GUI viewer: watch bots play or play against bot2 interactively
 python chessViewer.py
@@ -53,6 +52,26 @@ During a bot-vs-bot game, each bot independently tracks the full position. After
 ### Benchmark Harness — `botFighter.py`
 
 CLI script that runs N games with alternating colors (bot1=white on odd games) and writes structured per-move logs. Access internal stats via `bot.i` and `bot.prunings` as public attributes — `botMove()` itself returns only a 4-tuple.
+
+**Benchmark protocol:** Always run `--games 10 --time-limit 0.5`. Run benchmarks in the background so they don't block. After each implementation, check: (1) no crashes, (2) avg_depth increases or avg_nodes/move decreases, (3) win rate does not drop significantly below ~55%.
+
+### Search Architecture — bot2
+
+bot2 uses **negamax** (not dual-branch minimax). Scores are always relative to the side to move (positive = good for current player). Key implications:
+- `evaluatePosition()` returns a white-positive absolute score; bot2 negates it when it's black's turn at leaf nodes
+- Alpha/beta window is passed as `(-beta, -alpha)` on recursive calls and the result is negated
+- **Timeout sentinel**: uses `self._stop_search` flag rather than returning `±inf`. When time expires, the flag is set and every ancestor node breaks without incorporating the timed-out score. This prevents `-inf` being negated to `+inf` and corrupting the search.
+
+**Implemented and working:**
+- Incremental undo (`UndoRecord`) and king position tracking
+- MVV-LVA capture ordering + history heuristic for quiet moves
+- Killer move heuristic (2 killers per depth, reset each `botMove()`)
+- TT hash-move ordering (3-tuple: depth, eval, best_move)
+- Evaluation: passed pawns, rooks on open/semi-open files, isolated pawn penalty
+
+**Reverted — do not re-implement without fixing the root cause:**
+- **Quiescence search** (standalone): `getLegalMoves()` and `evaluatePosition()` are too expensive at every leaf; tested at qdepth 1–4, all produced 0% win rate. Now viable again with negamax — attempt using `_quiesce(alpha, beta)` with stand-pat.
+- **Null move pruning**: The dual-branch minimax structure caused incorrect cutoffs (now moot since negamax refactor). Still risky — needs zugzwang guard (piece count > 4) and no consecutive null moves.
 
 ### GUI — `chessViewer.py`
 
