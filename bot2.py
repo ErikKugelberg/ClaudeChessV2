@@ -96,6 +96,19 @@ class chessBoard2:
                      0,  0,  0,  0,  0,  0,  0,  0,
                      0,  0,  0,  0,  0,  0,  0,  0,]
 
+    # Precomputed rank masks for passed-pawn detection
+    _RANKS_AHEAD  = [sum(0xFF << (r * 8) for r in range(y + 1, 8)) for y in range(8)]
+    _RANKS_BEHIND = [sum(0xFF << (r * 8) for r in range(0, y))     for y in range(8)]
+    # Precomputed adjacent-file masks (files x-1, x, x+1) per file
+    _FILES_AROUND = [
+        sum(0x0101010101010101 << col for col in range(max(0, x - 1), min(8, x + 2)))
+        for x in range(8)
+    ]
+    # Precomputed single-file masks
+    _FILE_MASK = [0x0101010101010101 << x for x in range(8)]
+    # Passed pawn rank bonus (index = white-perspective rank 0-7)
+    _PASSED_BONUS = [0, 0, 0, 10, 20, 35, 60, 100]
+
     def __init__(self):
         self.board = []
         self.whitesMove = True              # True if it is whites move
@@ -222,6 +235,42 @@ class chessBoard2:
                 WSum += Wdoubled*self.doublePawnValue
             if Bdoubled > 1:
                 BSum += Bdoubled*self.doublePawnValue
+
+        # Passed pawn bonus, rook open-file bonus, and isolated pawn penalty
+        for x in range(8):
+            fa = self._FILES_AROUND[x]
+            fm = self._FILE_MASK[x]
+            adj = (self._FILE_MASK[x - 1] if x > 0 else 0) | (self._FILE_MASK[x + 1] if x < 7 else 0)
+            w_no_pawn = not (WPawnArray & fm)
+            b_no_pawn = not (BPawnArray & fm)
+
+            # Isolated pawn penalty
+            if (WPawnArray & fm) and not (WPawnArray & adj):
+                WSum -= 20
+            if (BPawnArray & fm) and not (BPawnArray & adj):
+                BSum -= 20
+
+            # Rook open/semi-open file bonus
+            for y in range(8):
+                piece = self.board[y * 8 + x]
+                if piece == Wrook:
+                    if w_no_pawn and b_no_pawn:
+                        WSum += 50
+                    elif w_no_pawn:
+                        WSum += 25
+                elif piece == Brook:
+                    if w_no_pawn and b_no_pawn:
+                        BSum += 50
+                    elif b_no_pawn:
+                        BSum += 25
+
+            # Passed pawn bonus
+            for y in range(2, 7):
+                idx_bit = 1 << (x + y * 8)
+                if (WPawnArray & idx_bit) and not (BPawnArray & (fa & self._RANKS_AHEAD[y])):
+                    WSum += self._PASSED_BONUS[y]
+                if (BPawnArray & idx_bit) and not (WPawnArray & (fa & self._RANKS_BEHIND[y])):
+                    BSum += self._PASSED_BONUS[7 - y]
 
         if (BkingCoord[0] == -1) or (WkingCoord[0] == -1):
             print(self.board)
