@@ -460,8 +460,11 @@ class chessBoard2:
 
         # Transposition table lookup — key encodes full game state, not just pieces
         ttKey = (self._toString(self.board), self.whitesMove, self.rkMoved, self.enPas[0], self.enPas[1])
+        tt_move = None
         if self._ttable.containsKey(ttKey):
-            stored_depth, stored_eval = self._ttable[ttKey]
+            entry = self._ttable[ttKey]
+            stored_depth, stored_eval = entry[0], entry[1]
+            tt_move = entry[2] if len(entry) > 2 else None
             if stored_depth >= entry_depth:
                 self.lookUps += 1
                 return stored_eval
@@ -469,7 +472,7 @@ class chessBoard2:
         if depth == 0:
             self.i += 1
             eval_val = self.evaluatePosition()
-            self._ttable[ttKey] = (0, eval_val)
+            self._ttable[ttKey] = (0, eval_val, None)
             return eval_val
 
         if self.whitesMove:
@@ -486,10 +489,11 @@ class chessBoard2:
                 return 0 # stalemate
 
         storeWhitesMove = self.whitesMove
+        best_move = None
 
         # Sort moves to be best first
         if remaining != 0:
-            moves = self._sortMoves(moves, storeWhitesMove, entry_depth)
+            moves = self._sortMoves(moves, storeWhitesMove, entry_depth, tt_move)
         else:
             newMoves = [move for move in moves if move.getAttacking() == 1]
             if len(newMoves) != 0:
@@ -513,7 +517,9 @@ class chessBoard2:
                     return float('inf')
 
             if storeWhitesMove:
-                bestEval = max(evaluation, bestEval)
+                if evaluation > bestEval:
+                    bestEval = evaluation
+                    best_move = move
                 alpha = max(evaluation, alpha)
                 if beta <= alpha:
                     self.prunings += 1
@@ -523,10 +529,12 @@ class chessBoard2:
                             self._killers[entry_depth][1] = self._killers[entry_depth][0]
                             self._killers[entry_depth][0] = move
                     self._undoMove(rec)
-                    self._ttable[ttKey] = (entry_depth, bestEval)
+                    self._ttable[ttKey] = (entry_depth, bestEval, move)
                     return bestEval
             else:
-                bestEval = min(evaluation, bestEval)
+                if evaluation < bestEval:
+                    bestEval = evaluation
+                    best_move = move
                 beta = min(evaluation, beta)
                 if beta <= alpha:
                     self.prunings += 1
@@ -536,11 +544,11 @@ class chessBoard2:
                             self._killers[entry_depth][1] = self._killers[entry_depth][0]
                             self._killers[entry_depth][0] = move
                     self._undoMove(rec)
-                    self._ttable[ttKey] = (entry_depth, bestEval)
+                    self._ttable[ttKey] = (entry_depth, bestEval, move)
                     return bestEval
             self._undoMove(rec)
 
-        self._ttable[ttKey] = (entry_depth, bestEval)
+        self._ttable[ttKey] = (entry_depth, bestEval, best_move)
         return bestEval
 
     # Moves the pieces, but doesn't update things like en Passant, board history and rokad logic
@@ -830,7 +838,9 @@ class chessBoard2:
     # MVV-LVA score: captures scored by (10*victim_value - attacker_value), quiet moves score 0
     _MVV_LVA_VALUES = [0, 100, 300, 300, 500, 900, 20000, 0, 100, 300, 300, 500, 900, 20000]
 
-    def _mvvLvaScore(self, move, depth=0):
+    def _mvvLvaScore(self, move, depth=0, tt_move=None):
+        if tt_move is not None and move == tt_move:
+            return 2_000_000
         victim = self.board[move.getX2() + move.getY2()*8]
         if victim != empty:
             attacker = self.board[move.getX1() + move.getY1()*8]
@@ -841,9 +851,9 @@ class chessBoard2:
             return 800_000
         return self._history[move.getX1() + move.getY1()*8][move.getX2() + move.getY2()*8]
 
-    # Return a list of moves, sorted by MVV-LVA for captures, killers, and history for quiet moves
-    def _sortMoves(self, moves, whitesMove, depth=0):
-        moves.sort(key=lambda m: self._mvvLvaScore(m, depth), reverse=True)
+    # Return a list of moves, sorted by TT move, MVV-LVA captures, killers, and history
+    def _sortMoves(self, moves, whitesMove, depth=0, tt_move=None):
+        moves.sort(key=lambda m: self._mvvLvaScore(m, depth, tt_move), reverse=True)
         return moves
 
     # Compress chess board to string for map 1200, 
