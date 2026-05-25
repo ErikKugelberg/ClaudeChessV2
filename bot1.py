@@ -1,0 +1,789 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sun Dec 10 22:00:27 2023
+
+@author: kugel
+"""
+import numpy as np
+import random
+import time
+
+from utils import *
+
+class chessBoard1:
+    # Combinations of moves a knight can make
+    knightMoves = [[-2,1], [-1,2], [1,2], [2,1], [2,-1], [1,-2], [-1,-2], [-2,-1]]
+
+    # Piece Values for evaluating a position, same Indexing as above
+    pValues = [0,100,300,300,500,900,0,0,100,300,300,500,900,0]
+    kingInCheckValue = 50
+    doublePawnValue = -50
+    attackValue = 10         # The value of attacking a square, should be the same as in the queen weight board
+    castelingValue = 100
+
+    # Weight boards for the different pieces
+    kingWBE       = [-10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                    10, 10, 10,-10,-10, 10, 10, 10,
+                    20, 30, 20, 10, 10, 20, 30, 20,]
+
+    kingWBL      = [ 0,  0,  0,  0,  0,  0,  0,  0,
+                    50, 50, 50, 50, 50, 50, 50, 50,
+                    40, 40, 40, 40, 40, 40, 40, 40,
+                    30, 30, 30, 30, 30, 30, 30, 30,
+                    20, 20, 20, 20, 20, 20, 20, 20,
+                    10, 10, 10, 10, 10, 10, 10, 10,
+                     0,  0,  0,  0,  0,  0,  0,  0,
+                   -10,-10,-10,-10,-10,-10,-10,-10,]
+
+    queenWBE    = [-10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                     0,  0,  0,  0,  0,  0,  0,  0,
+                     0,  0,  0,  0,  0,  0,  0,  0,]
+    queenWBE = [item*10 for item in queenWBE]
+
+    rookWBE    =  [-10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                   -10,-10,-10,-10,-10,-10,-10,-10,
+                     0,  0, 10, 10, 10, 10,  0,  0,
+                    10, 10, 20, 20, 20, 20, 10, 10,]
+
+    bishKnighWB = [ 0,  0,  0,  0,  0,  0,  0, 0,
+                    0,  0,  0,  0,  0,  0,  0, 0,
+                    0, 20, 20, 20, 20, 20, 20, 0,
+                    0, 20, 20, 20, 20, 20, 20, 0,
+                    0, 20, 20, 20, 20, 20, 20, 0,
+                    0, 20, 20, 20, 20, 20, 20, 0,
+                    0, 10, 10, 10, 10, 10, 10, 0,
+                    0, 10, 10, 10, 10, 10, 10, 0,]
+
+    pawnWBE      = [ 0, 0, 0, 0, 0, 0, 0, 0,
+                     0, 0, 0, 0, 0, 0, 0, 0,
+                     0, 0, 0, 0, 0, 0, 0, 0,
+                     0, 0, 0,10,10, 0, 0, 0,
+                     0, 0, 0,20,20, 0, 0, 0,
+                    20, 0,10,20,20,10, 0,20,
+                    20,20,20, 0, 0,20,20,20,
+                     0, 0, 0, 0, 0, 0, 0, 0,]
+
+    pawnWBL      = [ 0,  0,  0,  0,  0,  0,  0,  0,
+                    50, 50, 50, 50, 50, 50, 50, 50,
+                    40, 40, 40, 40, 40, 40, 40, 40,
+                    30, 30, 30, 30, 30, 30, 30, 30,
+                    20, 20, 20, 20, 20, 20, 20, 20,
+                    10, 10, 10, 10, 10, 10, 10, 10,
+                     0,  0,  0,  0,  0,  0,  0,  0,
+                     0,  0,  0,  0,  0,  0,  0,  0,]
+
+    def __init__(self):
+        self.board = []
+        self.whitesMove = True              # True if it is whites move
+        # King / Rook has moved Brook(left), Bking, Brook(right), Wrook (left), Wking, Wrook(right)
+        self.rkMoved = 0b000000
+        # Keeps tracks of en passant, x y coordinates of pawn
+        self.enPas = [-1,-1]
+        self.boardHistory = []
+        self.i = 0
+        self.avgMoveTime = 0
+        self.prunings = 0
+        self.boardLookupMap = LimitedSizeDict(max_size=15600) # n*64=1 000 000 , 1MB
+        self.lookUps = 0
+        self.avgPositionsEvaluated = 0
+
+    # Return the current "score", positive means white is winning
+    def evaluatePosition(self) -> float:
+        bytePos = self._toString(self.board)
+        if self.boardLookupMap.containsKey(bytePos):
+            self.lookUps += 1
+            return self.boardLookupMap[bytePos]
+        WSum = 0
+        BSum = 0
+        Wattacks = 0
+        Battacks = 0
+        BmovesBoard = 0x0000000000000000
+        WmovesBoard = 0x0000000000000000
+        BkingCoord = [-1,-1]
+        WkingCoord = [-1,-1]
+        BPawnArray = 0x0000000000000000
+        WPawnArray = 0x0000000000000000
+
+        # Check if we are in the lategame
+        lateGame = False
+        if np.count_nonzero(self.board) < 15:
+            lateGame = True
+        for x in range(8):
+            for y in range(8):
+                # Add Piece Values
+                piece = self.board[y*8 + x]
+                if piece > pieceDivider:
+                    if piece == Bpawn:
+                        BPawnArray |= 1 << (x + y*8)
+                        if lateGame:
+                            BSum += self.pawnWBL[y*8 + x]
+                        else:
+                            BSum += self.pawnWBE[y*8 + x]
+                    elif (piece == Bbishop) or (piece == Bknight):
+                        BSum += self.bishKnighWB[y*8 + x]
+                    elif (piece == Brook) and not lateGame:
+                        BSum += self.rookWBE[y*8 + x]
+                    elif piece == Bking:
+                        if lateGame:
+                            BSum += self.kingWBL[y*8 + x]
+                        else:
+                            BSum += self.kingWBE[y*8 + x]
+                        BkingCoord = [x,y]
+                    elif (piece == Bqueen) and not lateGame:
+                        BSum += self.queenWBE[y*8 + x]
+                    BSum += self.pValues[piece]
+                    movesBoard, cnt = self._getMoves(x,y)
+                    BmovesBoard |= movesBoard
+                    Battacks += cnt
+                elif piece != 0:
+                    if piece == Wpawn:
+                        WPawnArray |= 1 << (x + y*8)
+                        if lateGame:
+                            WSum += self.pawnWBL[(7-y)*8 + x]
+                        else:
+                            WSum += self.pawnWBE[(7-y)*8 + x]
+                    elif (piece == Wbishop) or (piece == Wknight):
+                        WSum += self.bishKnighWB[(7-y)*8 + x]
+                    elif (piece == Wrook) and not lateGame:
+                        WSum += self.rookWBE[(7-y)*8 + x]
+                    elif piece == Wking:
+                        if lateGame:
+                            WSum += self.kingWBL[(7-y)*8 + x]
+                        else:
+                            WSum += self.kingWBE[(7-y)*8 + x]
+                        WkingCoord = [x,y]
+                    elif (piece == Wqueen) and not lateGame:
+                        WSum += self.queenWBE[(7-y)*8 + x]
+                    WSum += self.pValues[piece]
+                    movesBoard, cnt = self._getMoves(x,y)
+                    WmovesBoard |= movesBoard
+                    Wattacks += cnt
+        
+        
+        if not (self.rkMoved & (1 << 1)):
+            Bcnt = 0
+            if not (self.rkMoved & (1 << 0)):
+                Bcnt += 1
+            if not (self.rkMoved & (1 << 2)):
+                Bcnt += 1
+            BSum += Bcnt*self.castelingValue
+        if not (self.rkMoved & (1 << 4)):
+            Wcnt = 0
+            if not (self.rkMoved & (1 << 3)):
+                Wcnt += 1
+            if not (self.rkMoved & (1 << 5)):
+                Wcnt += 1
+            WSum += Wcnt*self.castelingValue
+
+        WSum += Wattacks*self.attackValue
+        BSum += Battacks*self.attackValue
+
+        # Check for doubled pawns
+        for i in range(8):
+            Wmask = (0x0101010101010101 << i) & WPawnArray
+            Bmask = (0x0101010101010101 << i) & BPawnArray
+            
+            Wdoubled, Bdoubled = 0, 0
+            for t in range(8):
+                if Wmask & (i << (8*t + i)):
+                    Wdoubled += 1
+                if Bmask & (i << (8*t + i)):
+                    Bdoubled += 1
+            if Wdoubled > 1:
+                WSum += Wdoubled*self.doublePawnValue
+            if Bdoubled > 1:
+                BSum += Bdoubled*self.doublePawnValue
+
+        if (BkingCoord[0] == -1) or (WkingCoord[0] == -1):
+            print(self.board)
+            while True:
+                time.sleep(1)
+
+        # Add check points
+        if WmovesBoard & (1 << (BkingCoord[0] + BkingCoord[1]*8)):
+            WSum += self.kingInCheckValue
+        if BmovesBoard & (1 << (WkingCoord[0] + WkingCoord[1]*8)):
+            BSum += self.kingInCheckValue
+
+        evaluation = (WSum - BSum)
+
+        # Based on what stockfish thinks at starting position:
+        if self.whitesMove:
+            evaluation += 17
+        else:
+            evaluation -= 17
+
+        self.boardLookupMap[bytePos] = evaluation
+        return evaluation
+
+    # Let the bot make the best move
+    def botMove(self, timeLimit=3, depthLimit=99):
+        startTime = time.time()
+        d = 2
+        #self.i = 0
+        self.prunings = 0
+        self.lookUps = 0
+        prevMove : Move
+        if self.whitesMove:
+            prevEval = -float('inf')
+        else:
+            prevEval = float('inf')
+
+        moves = self.getLegalMoves()
+        while True:
+            move, self.evaluation, moves = self.findBestMove(depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves)
+            d += 1
+            if ((time.time() - startTime) > timeLimit):
+                if (self.whitesMove and (prevEval > self.evaluation)) or ((not self.whitesMove) and (prevEval < self.evaluation)):
+                    self.evaluation = prevEval
+                    move = prevMove
+                break
+            prevMove, prevEval = move, self.evaluation
+            if d == depthLimit:
+                break
+        self.depth = d
+
+        IIR = 10
+        self.avgMoveTime *= (IIR-1)
+        self.avgMoveTime += (time.time() - startTime)
+        self.avgMoveTime /= IIR
+        self.avgMoveTime = np.round(self.avgMoveTime, decimals=1)
+        print("White: ", self.whitesMove, "Positions: ", self.i, "  Prunings: ", self.prunings, "Depth: ", d, "LookUps: ", self.lookUps)
+
+        if move != None:
+            self.makeMove(move, frfr=True)
+             
+        return move, self.depth, self.avgMoveTime, self.evaluation
+            
+    # Returns list of all possible moves a player can make
+    def getLegalMoves(self) -> []:
+        moves = []
+        inCheck = self._kingChecked(self.whitesMove)
+        if (self.whitesMove):
+            for t in range(8):
+                for p in range(8):
+                    if (self.board[p*8 + t] < pieceDivider) and (self.board[p*8 + t] != empty):     
+                        board, nr = self._getMoves(t,p, rokad=not inCheck)                 
+                        currentMoves = board
+                        for x in range(8):
+                            for y in range(8):
+                                if currentMoves & (1 << (x + 8*y)):
+                                    move = Move(t,p,x,y)
+                                    if self._legalMove(move):
+                                        if self.board[x + y*8] != empty:
+                                            move.setAttacking()
+                                        moves.append(move)                  
+        else:
+            for t in range(8):
+                for p in range(8):
+                    if self.board[p*8 + t] > pieceDivider:
+                        board, nr = self._getMoves(t,p, rokad=not inCheck)                 
+                        currentMoves = board
+                        for x in range(8):
+                            for y in range(8):
+                                if currentMoves & (1 << (x + 8*y)):
+                                    move = Move(t,p,x,y)
+                                    if self._legalMove(move):
+                                        if self.board[x + y*8] != empty:
+                                            move.setAttacking()
+                                        moves.append(move)    
+        return moves
+
+    # Set up the board to starting position
+    def setupPieces(self):
+        self.board = [
+                    Wrook, Wknight, Wbishop, Wqueen, Wking, Wbishop, Wknight, Wrook,
+                    Wpawn, Wpawn, Wpawn, Wpawn, Wpawn, Wpawn, Wpawn, Wpawn,
+                    0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0,
+                    0, 0, 0, 0, 0, 0, 0, 0,
+                    Bpawn, Bpawn, Bpawn, Bpawn, Bpawn, Bpawn, Bpawn, Bpawn,
+                    Brook, Bknight, Bbishop, Bqueen, Bking, Bbishop, Bknight, Brook,
+                    ]
+        self.whitesMove = True
+        # King / Rook has moved Brook(left), Bking, Brook(right), Wrook (left), Wking, Wrook(right)
+        self.rkMoved = 0b000000
+        # Keeps tracks of en passant
+        self.enPas = [-1,-1]
+        self.boardHistory = []
+
+    # Execute a move, OBS: this does not care if it is legal or not!
+    def makeMove(self, move, frfr=False):
+        piece = self.board[move.getX2() + move.getY2()*8]
+        if (piece == Wking) or (piece == Bking):
+            print("the king was taken wtf ", self.board[move.getX1() + move.getY1()*8])
+
+        self._movePieces(move)
+        
+        piece = self.board[move.getX2() + move.getY2()*8]
+
+        # Keep track of en passant opportunities
+        if ((piece == Wpawn) or (piece == Bpawn)) and (np.abs(move.getY1()-move.getY2()) == 2):
+            self.enPas = [move.getX2(), move.getY2()]
+        else:
+            self.enPas = [-1,-1]
+
+        # Keep track of where a rokad has happened
+        if (piece == Brook):
+            if move.getX1() == 0:
+                self.rkMoved |= 1 << 0
+            else:
+                self.rkMoved |= 1 << 2
+        elif piece == Wrook:
+            if move.getX1() == 0:
+                self.rkMoved |= 1 << 3
+            else:
+                self.rkMoved |= 1 << 5
+        elif piece == Wking:
+            self.rkMoved |= 1 << 4
+        elif piece == Bking:
+            self.rkMoved |= 1 << 1
+        self.whitesMove = not self.whitesMove
+
+        self.boardHistory.append(self._toString(self.board))
+        if frfr:
+            if self.boardHistory.count(self._toString(self.board)) > 2:
+                return drawRep
+            else:
+                # Check for stalemate/win
+                moves = self.getLegalMoves()
+                if len(moves) == 0:
+                    if not self._kingChecked(checkWhiteKing=self.whitesMove):
+                        return staleMate
+                    elif self.whitesMove:
+                        print("Black wins!")
+                        return blackWin
+                    else:
+                        print("White wins!")
+                        return whiteWin
+        return onGoing
+
+    # Set position to a given chess position, if it is legal
+    def setPosition(self, newBoard, whitesMove):
+        oldBoard = self.board.copy()
+        self.board = newBoard.copy()
+        if self._kingChecked(not whitesMove):
+            self.board = oldBoard.copy()
+            print("Illegal position")
+            return False
+        self.whitesMove = whitesMove
+        return True
+
+    # Set position to a given chess position, if it is legal
+    def getPosition(self):
+        return self.board.copy()
+
+    # Returns the best move for a given position, the evaluation after this
+    def findBestMove(self, depthLimit = 1, timeLimit=1, startTime=0, moves=[]):
+        alpha = -float('inf')
+        beta = float('inf')
+
+        if len(moves) == 0:
+            if self._kingChecked(checkWhiteKing=self.whitesMove):
+                if self.whitesMove:
+                    return None, alpha, [] # We lose
+                else:
+                    return None, beta, [] # We lose
+            else:
+                return None, 0, [] # Stalemate
+
+        saveBoard = self.board.copy()
+        storeWhitesMove = self.whitesMove
+        storeRkMoved = self.rkMoved
+        storeEnPas = self.enPas.copy()
+
+        scores = []
+        for move in moves:
+            self.makeMove(move)
+            # self.whitesMove inverted, matches board state after 1 move
+            if (self.boardHistory.count(self._toString(self.board)) > 2):
+                self.boardHistory.pop()
+                scores.append(0) # Draw by repetition
+            else:
+                scores.append(self._recFindBestEval(depthLimit, alpha, beta, storeWhitesMove, timeLimit=timeLimit, startTime=startTime))
+            if storeWhitesMove:
+                alpha = max(scores[-1], alpha)
+            else:
+                beta = min(scores[-1], beta)
+            self.board = saveBoard.copy()
+            self.whitesMove = storeWhitesMove
+            self.rkMoved = storeRkMoved
+            self.boardHistory.pop()
+            self.enPas = storeEnPas.copy()
+        if storeWhitesMove:
+            bestEval = alpha
+        else:
+            bestEval = beta
+        indices = [index for index, score in enumerate(scores) if score == bestEval]
+        randomIndex = random.randint(0, len(indices)-1)
+        move = moves[indices[randomIndex]]
+        newMoves = list(zip(moves, scores))
+
+        # Sort the list of moves and scores based on the scores
+        newMoves.sort(key=lambda x: x[1], reverse=storeWhitesMove)
+        # Extract only the moves from the sorted list
+        newMoves = [item[0] for item in newMoves]
+
+        return move, bestEval, newMoves
+
+    # Returns the best eval of a certain move, given the following moves
+    def _recFindBestEval(self, depth, alpha, beta, whiteIsAnalyising, timeLimit, startTime):
+        if depth == 0:
+            self.i += 1
+            return self.evaluatePosition()
+        else:
+            if self.whitesMove:
+                bestEval = -float('inf')
+            else:
+                bestEval = float('inf')
+            depth -= 1 
+            moves = self.getLegalMoves()
+
+            if len(moves) == 0:
+                if self._kingChecked(checkWhiteKing=self.whitesMove):
+                    return bestEval # We lose
+                else:
+                    return 0 # Stalemate
+
+            saveBoard = self.board.copy()
+            storeWhitesMove = self.whitesMove
+            storeRkMoved = self.rkMoved
+            storeEnPas = self.enPas.copy()
+
+            # Sort moves to be best first
+            if depth != 0:
+                moves = self._sortMoves(moves, storeWhitesMove)
+            else:
+                newMoves = [move for move in moves if move.getAttacking() == 1]
+                if len(newMoves) != 0:
+                    moves = newMoves
+
+            for move in moves:
+                self.makeMove(move)
+                if (self.boardHistory.count(self._toString(self.board)) > 2):
+                    self.prunings += 1
+                    self.boardHistory.pop()
+                    return 0 # Draw by repetition
+                # self.whitesMove matches board state but the inverse should be analysed
+                evaluation = self._recFindBestEval(depth, alpha, beta, whiteIsAnalyising, timeLimit=timeLimit, startTime=startTime)
+
+                # Stop, if time ran out
+                if (time.time() - startTime) > timeLimit:
+                    self.board = saveBoard.copy()
+                    self.whitesMove = storeWhitesMove
+                    self.rkMoved = storeRkMoved
+                    self.boardHistory.pop()
+                    self.enPas = storeEnPas.copy()
+                    if whiteIsAnalyising:
+                        return -float('inf')
+                    else:
+                        return float('inf')
+
+                if storeWhitesMove:
+                    bestEval = max(evaluation, bestEval)
+                    alpha = max(evaluation, alpha)
+                    if beta <= alpha:
+                        self.prunings += 1
+                        self.boardHistory.pop()
+                        return bestEval                
+                else:
+                    bestEval = min(evaluation, bestEval)
+                    beta = min(evaluation, beta)
+                    if beta <= alpha:
+                        self.prunings += 1
+                        self.boardHistory.pop()
+                        return bestEval
+                self.board = saveBoard.copy()
+                self.whitesMove = storeWhitesMove
+                self.rkMoved = storeRkMoved
+                self.boardHistory.pop()
+                self.enPas = storeEnPas.copy()
+            return bestEval
+
+    # Moves the pieces, but doesn't update things like en Passant, board history and rokad logic
+    def _movePieces(self, move):
+        piece = self.board[move.getX1() + move.getY1()*8]
+        self.board[move.getX2() + move.getY2()*8] = piece    
+        self.board[move.getX1() + move.getY1()*8] = empty
+
+        # Do a Rokad
+        if piece == Wking:
+            if (not self.rkMoved & (1 << 4)) and (move.getX2() == 2) and (self.board[0] == Wrook):
+                self.board[0] = empty
+                self.board[3] = Wrook
+            elif (not self.rkMoved & (1 << 4)) and (move.getX2() == 6) and (self.board[7] == Wrook):
+                self.board[7] = empty
+                self.board[5] = Wrook
+        elif piece == Bking:
+            if (not self.rkMoved & (1 << 1)) and (move.getX2() == 2) and (self.board[7*8] == Brook):
+                self.board[7*8] = empty
+                self.board[59] = Brook
+            elif (not self.rkMoved & (1 << 1)) and (move.getX2() == 6) and (self.board[7 + 7*8] == Brook):
+                self.board[63] = empty
+                self.board[61] = Brook
+
+        # Check en Passant
+        if (self.enPas[0] == move.getX2()):
+            if ((piece == Bpawn) and (move.getY2() == self.enPas[1] - 1)) or ((piece == Wpawn) and (move.getY2() == self.enPas[1] + 1)):
+                self.board[self.enPas[0] + self.enPas[1]*8] = empty
+        
+        # Check for queened pawns
+        if (piece == Wpawn) and (move.getY2() == 7):
+            self.board[move.getX2() + move.getY2()*8] = Wqueen
+        elif (piece == Bpawn) and (move.getY2() == 0):
+            self.board[move.getX2() + move.getY2()*8] = Bqueen
+
+    # Check if a given move is legal
+    def _legalMove(self, move) -> bool:
+        # Store old board
+        oldBoard = self.board.copy()
+
+        self._movePieces(move)
+
+        # Check if new position is legal
+        legal = not self._kingChecked(self.whitesMove)      
+
+        self.board = oldBoard.copy()
+        return legal
+
+    # Checks if a king is checked
+    def _kingChecked(self, checkWhiteKing) -> bool:
+        kingCoord = [-1,-1]
+        movesBoard = 0x0000000000000000
+        if checkWhiteKing:
+            for t in range(8):
+                for p in range(8):
+                    piece = self.board[p*8 + t]
+                    if piece > pieceDivider:
+                        board, nr = self._getMoves(t,p)
+                        movesBoard |= board
+                    elif piece == Wking:
+                        kingCoord = [t,p]
+        else:
+            for t in range(8):
+                for p in range(8):
+                    piece = self.board[p*8 + t]
+                    if (piece < pieceDivider) and (piece != empty):
+                        board, nr = self._getMoves(t,p)
+                        movesBoard |= board
+                    elif piece == Bking:
+                        kingCoord = [t,p]
+
+        if movesBoard & (1 << (kingCoord[0] + kingCoord[1]*8)):
+            return True
+        return False
+   
+    # Follow a defined path on the board, setting the movesBoard to 1 along it until it runs into a piece
+    def _iterateMovesW(self,x,y,xt,yt, newBoard=0x0000000000000000, nrMoves=0):
+        t = x + xt
+        p = y + yt
+        while (t != 8) and (p != 8) and (t != -1) and (p != -1):
+            if self.board[p*8 + t] == empty:
+                newBoard |= (1 << (p*8+t))
+                nrMoves += 1
+                t += xt
+                p += yt
+            elif pieceDivider < self.board[p*8 + t]:
+                newBoard |= (1 << (p*8+t))
+                nrMoves += 2
+                t = 8
+            else:
+                t = 8
+        return newBoard, nrMoves
+
+    # Follow a defined path on the board, setting the movesBoard to 1 along it until it runs into a piece
+    def _iterateMovesB(self,x,y,xt,yt, newBoard=0x0000000000000000, nrMoves=0):
+        t = x + xt
+        p = y + yt
+        while (t != 8) and (p != 8) and (t != -1) and (p != -1):
+            if self.board[p*8 + t] == empty:
+                newBoard |= (1 << (p*8+t))
+                nrMoves += 1
+                t += xt
+                p += yt
+            elif pieceDivider > self.board[p*8 + t]:
+                newBoard |= (1 << (p*8+t))
+                nrMoves += 2
+                t = 8
+            else:
+                t = 8
+        return newBoard, nrMoves
+
+    # Update movesBoard, which shows which squares the current piece can go to
+    def _getMoves(self,x,y,rokad=False):
+        newBoard = 0x0000000000000000
+        nrMoves = 0
+        piece = self.board[y*8 + x]
+        if piece == Wpawn:
+            if y < 7:
+                if self.board[(y+1)*8+x] == empty:
+                    newBoard |= (1 << ((y+1)*8+x))
+                    nrMoves += 1
+                    if y == 1:
+                        if (self.board[(y+2)*8+x] == empty):
+                            newBoard |= (1 << ((y+2)*8+x))
+                            nrMoves += 1
+                if x != 0:
+                    if (self.board[(y+1)*8+(x-1)] > pieceDivider) or (self.enPas == [x-1,y]):
+                        newBoard |= (1 << ((y+1)*8+(x-1)))
+                        nrMoves += 2
+                if x != 7:
+                    if (self.board[(y+1)*8+(x+1)] > pieceDivider) or (self.enPas == [x+1,y]):
+                        newBoard |= (1 << ((y+1)*8+(x+1)))
+                        nrMoves += 2
+        elif piece == Bpawn:
+            if y > 0:
+                if self.board[x + (y-1)*8] == empty:
+                    newBoard |= (1 << ((y-1)*8+x))
+                    nrMoves += 1
+                    if y == 6:
+                        if (self.board[(y-2)*8+x] == empty):
+                            newBoard |= (1 << ((y-2)*8+x))
+                            nrMoves += 1
+                if x != 0:
+                    if ((self.board[(y-1)*8+(x-1)] < pieceDivider) and (self.board[(y-1)*8+(x-1)] != empty)) or (self.enPas == [x-1,y]):
+                        newBoard |= (1 << ((y-1)*8+(x-1)))
+                        nrMoves += 2
+                if x != 7:
+                    if ((self.board[(y-1)*8+(x+1)] < pieceDivider) and (self.board[(y-1)*8+(x+1)] != empty)) or (self.enPas == [x+1,y]):
+                        newBoard |= (1 << ((y-1)*8+(x+1)))
+                        nrMoves += 2
+        elif piece == Wrook:
+            newBoard, nrMoves = self._iterateMovesW(x,y,1,0, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,-1,0, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,0,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,0,-1, newBoard, nrMoves)
+        elif piece == Brook:
+            newBoard, nrMoves = self._iterateMovesB(x,y,1,0, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,-1,0, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,0,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,0,-1, newBoard, nrMoves)
+        elif piece == Wbishop:
+            newBoard, nrMoves = self._iterateMovesW(x,y,1,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,1,-1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,-1,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,-1,-1, newBoard, nrMoves)
+        elif piece == Bbishop:
+            newBoard, nrMoves = self._iterateMovesB(x,y,1,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,1,-1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,-1,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,-1,-1, newBoard, nrMoves)
+        elif piece == Wqueen:
+            newBoard, nrMoves = self._iterateMovesW(x,y,1,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,1,-1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,-1,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,-1,-1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,1,0, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,-1,0, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,0,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesW(x,y,0,-1, newBoard, nrMoves)
+        elif piece == Bqueen:
+            newBoard, nrMoves = self._iterateMovesB(x,y,1,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,1,-1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,-1,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,-1,-1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,1,0, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,-1,0, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,0,1, newBoard, nrMoves)
+            newBoard, nrMoves = self._iterateMovesB(x,y,0,-1, newBoard, nrMoves)
+        elif piece == Wking:
+            for t in range(3):
+                for p in range(3):
+                    xt = x -1 + t
+                    yp = y -1 + p
+                    if (0 <= xt <= 7) and (0 <= yp <= 7):
+                        if (self.board[yp*8 + xt] > pieceDivider) or (self.board[yp*8 + xt] == empty): 
+                            newBoard |= (1 << (yp*8+xt))
+                            nrMoves += 1
+            # Rokad logic
+            if rokad and (not self.rkMoved & (1 << 4)):
+                if (not self.rkMoved & (1 << 3)) and (self.board[1] == empty) and (self.board[2] == empty) and (self.board[3] == empty):
+                        newBoard |= (1 << 2)
+                        nrMoves += 1
+                if (not self.rkMoved & (1 << 5)) and (self.board[5] == empty) and (self.board[6] == empty):
+                        newBoard |= (1 << 6)
+                        nrMoves += 1        
+        elif piece == Bking:
+            for t in range(3):
+                for p in range(3):
+                    xt = x -1 + t
+                    yp = y -1 + p
+                    if (0 <= xt <= 7) and (0 <= yp <= 7):
+                        if (self.board[yp*8 + xt] < pieceDivider) or (self.board[yp*8 + xt] == empty):
+                            newBoard |= (1 << (yp*8+xt))
+                            nrMoves += 1
+            # Rokad logic
+            if rokad and (not self.rkMoved & (1 << 1)):
+                if (not self.rkMoved & (1 << 0)) and (self.board[57] == empty) and (self.board[58] == empty) and (self.board[59] == empty):
+                        newBoard |= (1 << 58)
+                        nrMoves += 1
+                if (not self.rkMoved & (1 << 2)) and (self.board[61] == empty)and (self.board[62] == empty):
+                        newBoard |= (1 << 62)
+                        nrMoves += 1
+        elif piece == Wknight:
+            for m in self.knightMoves:
+                xt = x + m[0]
+                yp = y + m[1]
+                if (0 <= xt <= 7) and (0 <= yp <= 7):
+                    nr = yp*8 + xt
+                    if (self.board[nr] == empty):
+                        newBoard |= (1 << nr)
+                        nrMoves += 1
+                    elif (self.board[nr] > pieceDivider):
+                        newBoard |= (1 << nr)
+                        nrMoves += 2
+        elif piece == Bknight:
+            for m in self.knightMoves:
+                xt = x + m[0]
+                yp = y + m[1]
+                if (0 <= xt <= 7) and (0 <= yp <= 7):
+                    nr = yp*8 + xt
+                    if  (self.board[nr] == empty):
+                        newBoard |= (1 << nr)
+                        nrMoves += 1
+                    elif (self.board[nr] < pieceDivider):
+                        newBoard |= (1 << nr)
+                        nrMoves += 2
+        return newBoard, nrMoves
+
+    # Return a list of moves, sorted for best eval
+    def _sortMoves(self, moves, whitesMove):
+        saveBoard = self.board.copy()
+        storeRkMoved = self.rkMoved
+        storeEnPas = self.enPas.copy()
+
+        newMoves = []
+        for move in moves:
+            self.makeMove(move)
+            curEval = self.evaluatePosition()
+            newMoves.append([move, curEval])
+            self.board = saveBoard.copy()
+            self.whitesMove = whitesMove
+            self.rkMoved = storeRkMoved
+            self.boardHistory.pop()
+            self.enPas = storeEnPas.copy()
+        # Sort the list of moves and scores based on the scores
+        newMoves.sort(key=lambda x: x[1], reverse=whitesMove)
+        return [item[0] for item in newMoves]
+
+    # Compress chess board to string for map 1200, 
+    def _toString(self, board):
+        code = 0x0000000000000000000000000000000000000000000000000000000000000000
+        for i, p in enumerate(board):
+            code |= p << i*4
+        return code
