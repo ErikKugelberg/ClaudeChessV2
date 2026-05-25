@@ -114,6 +114,7 @@ class chessBoard2:
         self.whiteKingPos = [4, 0]
         self.blackKingPos = [4, 7]
         self._history = [[0]*64 for _ in range(64)]
+        self._killers = [[None, None] for _ in range(128)]
 
     # Return the current "score", positive means white is winning
     def evaluatePosition(self) -> float:
@@ -252,6 +253,7 @@ class chessBoard2:
         self.prunings = 0
         self.lookUps = 0
         self._history = [[0]*64 for _ in range(64)]
+        self._killers = [[None, None] for _ in range(128)]
         prevMove : Move
         if self.whitesMove:
             prevEval = -float('inf')
@@ -487,7 +489,7 @@ class chessBoard2:
 
         # Sort moves to be best first
         if remaining != 0:
-            moves = self._sortMoves(moves, storeWhitesMove)
+            moves = self._sortMoves(moves, storeWhitesMove, entry_depth)
         else:
             newMoves = [move for move in moves if move.getAttacking() == 1]
             if len(newMoves) != 0:
@@ -517,6 +519,9 @@ class chessBoard2:
                     self.prunings += 1
                     if move.getAttacking() == 0:
                         self._history[move.getX1() + move.getY1()*8][move.getX2() + move.getY2()*8] += entry_depth * entry_depth
+                        if move != self._killers[entry_depth][0]:
+                            self._killers[entry_depth][1] = self._killers[entry_depth][0]
+                            self._killers[entry_depth][0] = move
                     self._undoMove(rec)
                     self._ttable[ttKey] = (entry_depth, bestEval)
                     return bestEval
@@ -527,6 +532,9 @@ class chessBoard2:
                     self.prunings += 1
                     if move.getAttacking() == 0:
                         self._history[move.getX1() + move.getY1()*8][move.getX2() + move.getY2()*8] += entry_depth * entry_depth
+                        if move != self._killers[entry_depth][0]:
+                            self._killers[entry_depth][1] = self._killers[entry_depth][0]
+                            self._killers[entry_depth][0] = move
                     self._undoMove(rec)
                     self._ttable[ttKey] = (entry_depth, bestEval)
                     return bestEval
@@ -822,16 +830,20 @@ class chessBoard2:
     # MVV-LVA score: captures scored by (10*victim_value - attacker_value), quiet moves score 0
     _MVV_LVA_VALUES = [0, 100, 300, 300, 500, 900, 20000, 0, 100, 300, 300, 500, 900, 20000]
 
-    def _mvvLvaScore(self, move):
+    def _mvvLvaScore(self, move, depth=0):
         victim = self.board[move.getX2() + move.getY2()*8]
         if victim != empty:
             attacker = self.board[move.getX1() + move.getY1()*8]
             return 1_000_000 + 10 * self._MVV_LVA_VALUES[victim] - self._MVV_LVA_VALUES[attacker]
+        if move == self._killers[depth][0]:
+            return 900_000
+        if move == self._killers[depth][1]:
+            return 800_000
         return self._history[move.getX1() + move.getY1()*8][move.getX2() + move.getY2()*8]
 
-    # Return a list of moves, sorted by MVV-LVA for captures and history for quiet moves
-    def _sortMoves(self, moves, whitesMove):
-        moves.sort(key=self._mvvLvaScore, reverse=True)
+    # Return a list of moves, sorted by MVV-LVA for captures, killers, and history for quiet moves
+    def _sortMoves(self, moves, whitesMove, depth=0):
+        moves.sort(key=lambda m: self._mvvLvaScore(m, depth), reverse=True)
         return moves
 
     # Compress chess board to string for map 1200, 

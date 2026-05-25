@@ -49,6 +49,12 @@ class Move:
     def setAttacking(self):
         self.data |= 1 << 12
 
+    def __eq__(self, other):
+        return other is not None and isinstance(other, Move) and self.data == other.data
+
+    def __hash__(self):
+        return hash(self.data)
+
 class LimitedSizeDict:
     def __init__(self, max_size):
         self.max_size = max_size
