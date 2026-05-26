@@ -497,7 +497,7 @@ class chessBoard2:
         return move, bestEval, newMoves
 
     # Returns the best eval of a certain move, given the following moves (negamax)
-    def _recFindBestEval(self, depth, alpha, beta, timeLimit, startTime):
+    def _recFindBestEval(self, depth, alpha, beta, timeLimit, startTime, allow_null=True):
         if self._stop_search:
             return -float('inf')
         if (time.time() - startTime) > timeLimit:
@@ -525,6 +525,25 @@ class chessBoard2:
 
         bestEval = -float('inf')
         remaining = depth - 1
+        best_move = None
+
+        # Null move pruning BEFORE getLegalMoves: when pruning, we skip the expensive getLegalMoves call.
+        # require remaining > R so opponent gets at least 1 real ply.
+        R = 2
+        if (allow_null and remaining > R
+                and not self._kingChecked(self.whitesMove)
+                and sum(1 for p in self.board if p != empty and p != Wpawn and p != Bpawn) > 4):
+            old_enPas = self.enPas[:]
+            self.enPas = [-1, -1]
+            self.whitesMove = not self.whitesMove
+            null_score = -self._recFindBestEval(remaining - R, -beta, -beta + 1,
+                                                 timeLimit=timeLimit, startTime=startTime,
+                                                 allow_null=False)
+            self.whitesMove = not self.whitesMove
+            self.enPas = old_enPas
+            if not self._stop_search and null_score >= beta:
+                return beta
+
         moves = self.getLegalMoves()
 
         if len(moves) == 0:
@@ -533,7 +552,6 @@ class chessBoard2:
             else:
                 return 0  # stalemate
 
-        best_move = None
         if remaining != 0:
             moves = self._sortMoves(moves, self.whitesMove, entry_depth, tt_move)
         else:
