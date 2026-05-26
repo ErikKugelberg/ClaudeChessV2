@@ -146,58 +146,42 @@ class chessBoard2:
         BPawnArray = 0x0000000000000000
         WPawnArray = 0x0000000000000000
 
-        # Check if we are in the lategame
-        lateGame = False
-        if np.count_nonzero(self.board) < 15:
-            lateGame = True
+        lateGame = (64 - self.board.count(0)) < 15
         for x in range(8):
             for y in range(8):
-                # Add Piece Values
                 piece = self.board[y*8 + x]
                 if piece > pieceDivider:
                     if piece == Bpawn:
                         BPawnArray |= 1 << (x + y*8)
-                        if lateGame:
-                            BSum += self.pawnWBL[y*8 + x]
-                        else:
-                            BSum += self.pawnWBE[y*8 + x]
-                    elif (piece == Bbishop) or (piece == Bknight):
+                        BSum += self.pawnWBL[y*8 + x] if lateGame else self.pawnWBE[y*8 + x]
+                    elif piece == Bbishop or piece == Bknight:
                         BSum += self.bishKnighWB[y*8 + x]
-                    elif (piece == Brook) and not lateGame:
+                    elif piece == Brook and not lateGame:
                         BSum += self.rookWBE[y*8 + x]
                     elif piece == Bking:
-                        if lateGame:
-                            BSum += self.kingWBL[y*8 + x]
-                        else:
-                            BSum += self.kingWBE[y*8 + x]
-                        BkingCoord = [x,y]
-                    elif (piece == Bqueen) and not lateGame:
+                        BSum += self.kingWBL[y*8 + x] if lateGame else self.kingWBE[y*8 + x]
+                        BkingCoord = [x, y]
+                    elif piece == Bqueen and not lateGame:
                         BSum += self.queenWBE[y*8 + x]
                     BSum += self.pValues[piece]
-                    movesBoard, cnt = self._getMoves(x,y)
+                    movesBoard, cnt = self._getMoves(x, y)
                     BmovesBoard |= movesBoard
                     Battacks += cnt
                 elif piece != 0:
                     if piece == Wpawn:
                         WPawnArray |= 1 << (x + y*8)
-                        if lateGame:
-                            WSum += self.pawnWBL[(7-y)*8 + x]
-                        else:
-                            WSum += self.pawnWBE[(7-y)*8 + x]
-                    elif (piece == Wbishop) or (piece == Wknight):
+                        WSum += self.pawnWBL[(7-y)*8 + x] if lateGame else self.pawnWBE[(7-y)*8 + x]
+                    elif piece == Wbishop or piece == Wknight:
                         WSum += self.bishKnighWB[(7-y)*8 + x]
-                    elif (piece == Wrook) and not lateGame:
+                    elif piece == Wrook and not lateGame:
                         WSum += self.rookWBE[(7-y)*8 + x]
                     elif piece == Wking:
-                        if lateGame:
-                            WSum += self.kingWBL[(7-y)*8 + x]
-                        else:
-                            WSum += self.kingWBE[(7-y)*8 + x]
-                        WkingCoord = [x,y]
-                    elif (piece == Wqueen) and not lateGame:
+                        WSum += self.kingWBL[(7-y)*8 + x] if lateGame else self.kingWBE[(7-y)*8 + x]
+                        WkingCoord = [x, y]
+                    elif piece == Wqueen and not lateGame:
                         WSum += self.queenWBE[(7-y)*8 + x]
                     WSum += self.pValues[piece]
-                    movesBoard, cnt = self._getMoves(x,y)
+                    movesBoard, cnt = self._getMoves(x, y)
                     WmovesBoard |= movesBoard
                     Wattacks += cnt
         
@@ -330,8 +314,10 @@ class chessBoard2:
 
         if move != None:
             self.makeMove(move, frfr=True)
-             
-        return move, self.depth, self.avgMoveTime, self.evaluation
+
+        # Normalize to white-positive convention: negate when black just moved (whitesMove is now True)
+        white_eval = self.evaluation if not self.whitesMove else -self.evaluation
+        return move, self.depth, self.avgMoveTime, white_eval
             
     # Returns list of all possible moves a player can make
     def getLegalMoves(self) -> []:
