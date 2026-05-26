@@ -11,13 +11,14 @@ import time
 from utils import *
 
 class UndoRecord:
-    __slots__ = ['changes', 'whitesMove', 'rkMoved', 'enPas']
+    __slots__ = ['changes', 'whitesMove', 'rkMoved', 'enPas', 'nonPawnCount']
 
-    def __init__(self, whitesMove, rkMoved, enPas):
+    def __init__(self, whitesMove, rkMoved, enPas, nonPawnCount):
         self.changes = []          # list of (board_index, old_value)
         self.whitesMove = whitesMove
         self.rkMoved = rkMoved
         self.enPas = enPas[:]
+        self.nonPawnCount = nonPawnCount
 
 
 class chessBoard2:
@@ -116,25 +117,22 @@ class chessBoard2:
         self.rkMoved = 0b000000
         # Keeps tracks of en passant, x y coordinates of pawn
         self.enPas = [-1,-1]
-        self.boardHistory = []
+        self.boardHistory = []         # stack of board hashes for the current game path
+        self.boardHistoryCounts = {}   # hash → count; O(1) repetition lookup
         self.i = 0
         self.avgMoveTime = 0
         self.prunings = 0
-        self.boardLookupMap = LimitedSizeDict(max_size=15600)
         self._ttable = LimitedSizeDict(max_size=100_000)
         self.lookUps = 0
         self.avgPositionsEvaluated = 0
         self.whiteKingPos = [4, 0]
         self.blackKingPos = [4, 7]
+        self.nonPawnCount = 0  # count of non-pawn pieces (including kings); used by null move guard
         self._history = [[0]*64 for _ in range(64)]
         self._killers = [[None, None] for _ in range(128)]
 
     # Return the current "score", positive means white is winning
     def evaluatePosition(self) -> float:
-        bytePos = self._toString(self.board)
-        if self.boardLookupMap.containsKey(bytePos):
-            self.lookUps += 1
-            return self.boardLookupMap[bytePos]
         WSum = 0
         BSum = 0
         Wattacks = 0
@@ -208,13 +206,8 @@ class chessBoard2:
         for i in range(8):
             Wmask = (0x0101010101010101 << i) & WPawnArray
             Bmask = (0x0101010101010101 << i) & BPawnArray
-            
-            Wdoubled, Bdoubled = 0, 0
-            for t in range(8):
-                if Wmask & (i << (8*t + i)):
-                    Wdoubled += 1
-                if Bmask & (i << (8*t + i)):
-                    Bdoubled += 1
+            Wdoubled = bin(Wmask).count('1')
+            Bdoubled = bin(Bmask).count('1')
             if Wdoubled > 1:
                 WSum += Wdoubled*self.doublePawnValue
             if Bdoubled > 1:
@@ -275,14 +268,13 @@ class chessBoard2:
         else:
             evaluation -= 17
 
-        self.boardLookupMap[bytePos] = evaluation
         return evaluation
 
     # Let the bot make the best move
     def botMove(self, timeLimit=3, depthLimit=99):
         startTime = time.time()
         d = 2
-        #self.i = 0
+        self.i = 0
         self.prunings = 0
         self.lookUps = 0
         self._history = [[0]*64 for _ in range(64)]
@@ -293,7 +285,20 @@ class chessBoard2:
 
         moves = self.getLegalMoves()
         while True:
-            move, self.evaluation, moves = self.findBestMove(depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves)
+            # Aspiration windows: narrow search window around previous result to prune more branches.
+            # Only use when we have a stable eval (not mate, not first iteration).
+            aw = 50
+            if d >= 3 and prevEval != -float('inf') and abs(prevEval) < 5000:
+                move, self.evaluation, moves = self.findBestMove(
+                    depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves,
+                    initial_alpha=prevEval - aw, initial_beta=prevEval + aw)
+                # On fail-low or fail-high, retry with full window
+                if not self._stop_search and (self.evaluation <= prevEval - aw or self.evaluation >= prevEval + aw):
+                    move, self.evaluation, moves = self.findBestMove(
+                        depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves)
+            else:
+                move, self.evaluation, moves = self.findBestMove(
+                    depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves)
             d += 1
             if ((time.time() - startTime) > timeLimit):
                 if prevEval > self.evaluation:  # timed out mid-search, use last complete result
@@ -371,8 +376,10 @@ class chessBoard2:
         # Keeps tracks of en passant
         self.enPas = [-1,-1]
         self.boardHistory = []
+        self.boardHistoryCounts = {}
         self.whiteKingPos = [4, 0]
         self.blackKingPos = [4, 7]
+        self.nonPawnCount = sum(1 for p in self.board if p != empty and p != Wpawn and p != Bpawn)
 
     # Execute a move, OBS: this does not care if it is legal or not!
     def makeMove(self, move, frfr=False):
@@ -407,9 +414,11 @@ class chessBoard2:
             self.rkMoved |= 1 << 1
         self.whitesMove = not self.whitesMove
 
-        self.boardHistory.append(self._toString(self.board))
+        _bh = self._toString(self.board)
+        self.boardHistory.append(_bh)
+        self.boardHistoryCounts[_bh] = self.boardHistoryCounts.get(_bh, 0) + 1
         if frfr:
-            if self.boardHistory.count(self._toString(self.board)) > 2:
+            if self.boardHistoryCounts[_bh] > 2:
                 return drawRep
             else:
                 # Check for stalemate/win
@@ -434,6 +443,7 @@ class chessBoard2:
             print("Illegal position")
             return False
         self.whitesMove = whitesMove
+        self.nonPawnCount = sum(1 for p in self.board if p != empty and p != Wpawn and p != Bpawn)
         return True
 
     # Set position to a given chess position, if it is legal
@@ -441,10 +451,11 @@ class chessBoard2:
         return self.board.copy()
 
     # Returns the best move for a given position, the evaluation after this (negamax)
-    def findBestMove(self, depthLimit = 1, timeLimit=1, startTime=0, moves=[]):
+    def findBestMove(self, depthLimit=1, timeLimit=1, startTime=0, moves=[],
+                     initial_alpha=-float('inf'), initial_beta=float('inf')):
         self._stop_search = False
-        alpha = -float('inf')
-        beta = float('inf')
+        alpha = initial_alpha
+        beta = initial_beta
 
         if len(moves) == 0:
             if self._kingChecked(checkWhiteKing=self.whitesMove):
@@ -456,7 +467,8 @@ class chessBoard2:
         for move in moves:
             rec = self._saveState(move)
             self.makeMove(move)
-            if (self.boardHistory.count(self._toString(self.board)) > 2):
+            _cur = self._toString(self.board)
+            if (self.boardHistoryCounts.get(_cur, 0) > 2):
                 scores.append(0)  # Draw by repetition
             else:
                 score = -self._recFindBestEval(depthLimit, -beta, -alpha, timeLimit=timeLimit, startTime=startTime)
@@ -466,6 +478,8 @@ class chessBoard2:
             if self._stop_search:
                 break
             alpha = max(scores[-1], alpha)
+            if alpha >= beta:  # fail-high at root: stop (botMove will retry with wider window)
+                break
 
         if len(scores) == 0:
             return moves[0], -float('inf'), moves  # timed out before any move was evaluated
@@ -483,7 +497,7 @@ class chessBoard2:
         return move, bestEval, newMoves
 
     # Returns the best eval of a certain move, given the following moves (negamax)
-    def _recFindBestEval(self, depth, alpha, beta, timeLimit, startTime, allow_null=True):
+    def _recFindBestEval(self, depth, alpha, beta, timeLimit, startTime, allow_null=True, allow_lmr=True):
         if self._stop_search:
             return -float('inf')
         if (time.time() - startTime) > timeLimit:
@@ -493,7 +507,8 @@ class chessBoard2:
         entry_depth = depth
 
         # Transposition table lookup — key encodes full game state, not just pieces
-        ttKey = (self._toString(self.board), self.whitesMove, self.rkMoved, self.enPas[0], self.enPas[1])
+        _bh = self._toString(self.board)
+        ttKey = (_bh, self.whitesMove, self.rkMoved, self.enPas[0], self.enPas[1])
         tt_move = None
         if self._ttable.containsKey(ttKey):
             entry = self._ttable[ttKey]
@@ -518,7 +533,7 @@ class chessBoard2:
         R = 2
         if (allow_null and remaining > R
                 and not self._kingChecked(self.whitesMove)
-                and sum(1 for p in self.board if p != empty and p != Wpawn and p != Bpawn) > 4):
+                and self.nonPawnCount > 4):
             old_enPas = self.enPas[:]
             self.enPas = [-1, -1]
             self.whitesMove = not self.whitesMove
@@ -545,13 +560,27 @@ class chessBoard2:
             if len(newMoves) != 0:
                 moves = newMoves
 
-        for move in moves:
+        for move_idx, move in enumerate(moves):
             rec = self._saveState(move)
             self.makeMove(move)
-            if (self.boardHistory.count(self._toString(self.board)) > 2):
+            _cur = self._toString(self.board)
+            if (self.boardHistoryCounts.get(_cur, 0) > 2):
                 score = 0  # Draw by repetition — score this move as draw, keep searching
             else:
-                score = -self._recFindBestEval(remaining, -beta, -alpha, timeLimit=timeLimit, startTime=startTime)
+                # Late Move Reduction: try late quiet moves at reduced depth (no cascading).
+                # Skip LMR if the move gives check — check-giving moves can be critical.
+                gives_check = self._kingChecked(self.whitesMove)
+                if (allow_lmr and not gives_check and move_idx >= 3 and remaining >= 2
+                        and move.getAttacking() == 0 and not self._stop_search):
+                    score = -self._recFindBestEval(remaining - 1, -alpha - 1, -alpha,
+                                                    timeLimit=timeLimit, startTime=startTime,
+                                                    allow_lmr=False)
+                    # If LMR didn't fail low, re-search at full depth
+                    if not self._stop_search and score > alpha:
+                        score = -self._recFindBestEval(remaining, -beta, -alpha,
+                                                        timeLimit=timeLimit, startTime=startTime)
+                else:
+                    score = -self._recFindBestEval(remaining, -beta, -alpha, timeLimit=timeLimit, startTime=startTime)
             self._undoMove(rec)
 
             if self._stop_search:
@@ -578,8 +607,11 @@ class chessBoard2:
     # Moves the pieces, but doesn't update things like en Passant, board history and rokad logic
     def _movePieces(self, move):
         piece = self.board[move.getX1() + move.getY1()*8]
+        captured = self.board[move.getX2() + move.getY2()*8]
         self.board[move.getX2() + move.getY2()*8] = piece
         self.board[move.getX1() + move.getY1()*8] = empty
+        if captured != empty and captured != Wpawn and captured != Bpawn:
+            self.nonPawnCount -= 1
 
         if piece == Wking:
             self.whiteKingPos = [move.getX2(), move.getY2()]
@@ -610,12 +642,14 @@ class chessBoard2:
         # Check for queened pawns
         if (piece == Wpawn) and (move.getY2() == 7):
             self.board[move.getX2() + move.getY2()*8] = Wqueen
+            self.nonPawnCount += 1
         elif (piece == Bpawn) and (move.getY2() == 0):
             self.board[move.getX2() + move.getY2()*8] = Bqueen
+            self.nonPawnCount += 1
 
     # Capture the board squares that will change for the given move (call before _movePieces)
     def _saveState(self, move):
-        rec = UndoRecord(self.whitesMove, self.rkMoved, self.enPas)
+        rec = UndoRecord(self.whitesMove, self.rkMoved, self.enPas, self.nonPawnCount)
         x1, y1, x2, y2 = move.getX1(), move.getY1(), move.getX2(), move.getY2()
         piece = self.board[x1 + y1*8]
         rec.changes.append((x1 + y1*8, piece))
@@ -649,7 +683,13 @@ class chessBoard2:
         self.whitesMove = rec.whitesMove
         self.rkMoved = rec.rkMoved
         self.enPas = rec.enPas
-        self.boardHistory.pop()
+        self.nonPawnCount = rec.nonPawnCount
+        _bh = self.boardHistory.pop()
+        cnt = self.boardHistoryCounts.get(_bh, 0) - 1
+        if cnt <= 0:
+            self.boardHistoryCounts.pop(_bh, None)
+        else:
+            self.boardHistoryCounts[_bh] = cnt
 
     # Check if a given move is legal
     def _legalMove(self, move) -> bool:
