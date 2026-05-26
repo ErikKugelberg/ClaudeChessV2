@@ -2,22 +2,27 @@
 botFighter.py — Automated benchmark harness for comparing chessBoard1 vs chessBoard2.
 
 Usage:
-    python botFighter.py [--games N] [--time-limit T]
+    python botFighter.py [--games N] [--time-limit T] [--workers W]
 
     --games      Number of games to play (default: 20, must be even for balanced colors)
     --time-limit Seconds allowed per move (default: 0.5)
+    --workers    Parallel worker processes (default: cpu_count; use 1 for sequential mode)
 
-Outputs a structured log to logs/benchmark_<timestamp>.log and prints a
-summary table to stdout after all games complete.
+In parallel mode, per-move logs are buffered and written to the log file in game order
+after all games finish. Progress is reported as "[N/total games done]" on stdout.
+In sequential mode (--workers 1), per-move logs stream to stdout in real time.
 """
 
 import argparse
+import io
 import logging
+import math
+import multiprocessing
 import os
 import sys
 import time
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from utils import (
     onGoing, drawRep, staleMate, blackWin, whiteWin,
@@ -30,14 +35,13 @@ from bot2 import chessBoard2
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_MOVES_PER_GAME = 250   # half-moves; game declared draw beyond this
+MAX_MOVES_PER_GAME = 250
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
 def setup_logger(log_dir: str = "logs") -> Tuple[logging.Logger, str]:
-    """Create a dual-target logger (file + stdout)."""
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = os.path.join(log_dir, f"benchmark_{timestamp}.log")
@@ -45,7 +49,6 @@ def setup_logger(log_dir: str = "logs") -> Tuple[logging.Logger, str]:
     fmt = logging.Formatter("%(message)s")
     logger = logging.getLogger("benchmark")
     logger.setLevel(logging.DEBUG)
-    # Avoid duplicate handlers when the module is reloaded
     logger.handlers.clear()
 
     fh = logging.FileHandler(log_path, encoding="utf-8")
@@ -60,7 +63,7 @@ def setup_logger(log_dir: str = "logs") -> Tuple[logging.Logger, str]:
 
 
 # ---------------------------------------------------------------------------
-# Move / eval formatting helpers
+# Formatting helpers
 # ---------------------------------------------------------------------------
 
 def _eval_str(evaluation: float) -> str:
@@ -76,36 +79,7 @@ def _move_str(move: Move) -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# Per-move logger
-# ---------------------------------------------------------------------------
-
-def log_move(
-    log: logging.Logger,
-    game_num: int,
-    half_move: int,
-    color: str,          # "W" or "B"
-    bot_label: str,      # "bot1" or "bot2"
-    move: Move,
-    depth: int,
-    nodes: int,
-    prunings: int,
-    elapsed: float,
-    evaluation: float,
-) -> None:
-    log.info(
-        f"[G{game_num:02d} M{half_move:03d} {color}/{bot_label}] "
-        f"depth={depth} nodes={nodes} prunings={prunings} "
-        f"time={elapsed:.2f}s eval={_eval_str(evaluation)} move={_move_str(move)}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Result helpers
-# ---------------------------------------------------------------------------
-
 def _result_label(result_code: int, white_label: str, black_label: str) -> str:
-    """Translate internal result code to human-readable string."""
     if result_code == whiteWin:
         return f"{white_label.upper()} WINS (white)"
     if result_code == blackWin:
@@ -118,7 +92,7 @@ def _result_label(result_code: int, white_label: str, black_label: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Single-game runner
+# Single-game runner (used by both sequential and parallel paths)
 # ---------------------------------------------------------------------------
 
 def run_game(
@@ -127,16 +101,16 @@ def run_game(
     bot2: chessBoard2,
     bot1_plays_white: bool,
     time_limit: float,
-    log: logging.Logger,
-) -> Tuple[int, int, int, List[int], List[int], List[int], List[int]]:
+) -> tuple:
     """
-    Play one complete game.
+    Play one complete game. Returns a tuple:
+        (game_num, result_code, half_moves,
+         bot1_depths, bot2_depths, bot1_nodes, bot2_nodes,
+         white_label, black_label,
+         bot1_blunders, bot2_blunders,
+         log_lines)
 
-    Returns
-    -------
-    (result_code, total_half_moves,
-     bot1_depths, bot2_depths, bot1_nodes, bot2_nodes)
-    where result_code is one of: whiteWin, blackWin, staleMate, drawRep, or -1 (move limit).
+    log_lines is a List[str] of per-move log messages for this game.
     """
     bot1.setupPieces()
     bot2.setupPieces()
@@ -146,56 +120,67 @@ def run_game(
     white_label = "bot1" if bot1_plays_white else "bot2"
     black_label = "bot2" if bot1_plays_white else "bot1"
 
-    log.info(f"\n--- GAME {game_num:02d}: {white_label}=WHITE  {black_label}=BLACK ---")
+    lines: List[str] = [
+        f"\n--- GAME {game_num:02d}: {white_label}=WHITE  {black_label}=BLACK ---"
+    ]
 
     bot1_depths: List[int] = []
     bot2_depths: List[int] = []
     bot1_nodes:  List[int] = []
     bot2_nodes:  List[int] = []
 
-    half_move = 0
-    result_code = -1   # -1 = move-limit draw
+    half_move    = 0
+    result_code  = -1
+    BLUNDER_CP   = 150
+    last_w_eval: Optional[float] = None
+    last_b_eval: Optional[float] = None
+    white_blunders = 0
+    black_blunders = 0
 
     while half_move < MAX_MOVES_PER_GAME:
         # ------------------------------------------------------------------
         # White's move
         # ------------------------------------------------------------------
         t0 = time.time()
-        move, depth, avg_t, evaluation = white_bot.botMove(
+        move, depth, _avg_t, evaluation = white_bot.botMove(
             depthLimit=99, timeLimit=time_limit
         )
         elapsed = time.time() - t0
 
-        # Accumulate depth/node stats for the bot that just moved
         if white_label == "bot1":
-            bot1_depths.append(depth)
-            bot1_nodes.append(white_bot.i)
+            bot1_depths.append(depth); bot1_nodes.append(white_bot.i)
         else:
-            bot2_depths.append(depth)
-            bot2_nodes.append(white_bot.i)
-
+            bot2_depths.append(depth); bot2_nodes.append(white_bot.i)
         half_move += 1
 
         if move is None:
-            # White is checkmated or stalemated (getLegalMoves returned empty)
-            if white_bot._kingChecked(white_bot.whitesMove):
-                result_code = blackWin
-            else:
-                result_code = staleMate
-            log.info(
+            result_code = (blackWin if white_bot._kingChecked(white_bot.whitesMove)
+                           else staleMate)
+            lines.append(
                 f"[G{game_num:02d} M{half_move:03d} W/{white_label}] "
                 f"No legal moves -> {_result_label(result_code, white_label, black_label)}"
             )
             break
 
-        log_move(log, game_num, half_move, "W", white_label,
-                 move, depth, white_bot.i, white_bot.prunings, elapsed, evaluation)
+        w_blunder = None
+        if last_w_eval is not None:
+            delta = evaluation - last_w_eval
+            if delta < -BLUNDER_CP:
+                w_blunder = round(delta / 100, 2)
+                white_blunders += 1
+        last_w_eval = evaluation
 
-        # Apply white's move to the black bot's board state
+        blunder_str = f" BLUNDER(d={w_blunder:+.2f})" if w_blunder is not None else ""
+        lines.append(
+            f"[G{game_num:02d} M{half_move:03d} W/{white_label}] "
+            f"depth={depth} nodes={white_bot.i} prunings={white_bot.prunings} "
+            f"time={elapsed:.2f}s eval={_eval_str(evaluation)} move={_move_str(move)}{blunder_str}"
+        )
+
         gs = black_bot.makeMove(move, frfr=True)
         if gs in (staleMate, drawRep, blackWin, whiteWin):
             result_code = gs
-            log.info(
+            lines.append(
                 f"[G{game_num:02d}] After W move: "
                 f"{_result_label(result_code, white_label, black_label)}"
             )
@@ -205,47 +190,52 @@ def run_game(
         # Black's move
         # ------------------------------------------------------------------
         t0 = time.time()
-        move, depth, avg_t, evaluation = black_bot.botMove(
+        move, depth, _avg_t, evaluation = black_bot.botMove(
             depthLimit=99, timeLimit=time_limit
         )
         elapsed = time.time() - t0
 
         if black_label == "bot1":
-            bot1_depths.append(depth)
-            bot1_nodes.append(black_bot.i)
+            bot1_depths.append(depth); bot1_nodes.append(black_bot.i)
         else:
-            bot2_depths.append(depth)
-            bot2_nodes.append(black_bot.i)
-
+            bot2_depths.append(depth); bot2_nodes.append(black_bot.i)
         half_move += 1
 
         if move is None:
-            if black_bot._kingChecked(black_bot.whitesMove):
-                result_code = whiteWin
-            else:
-                result_code = staleMate
-            log.info(
+            result_code = (whiteWin if black_bot._kingChecked(black_bot.whitesMove)
+                           else staleMate)
+            lines.append(
                 f"[G{game_num:02d} M{half_move:03d} B/{black_label}] "
                 f"No legal moves -> {_result_label(result_code, white_label, black_label)}"
             )
             break
 
-        log_move(log, game_num, half_move, "B", black_label,
-                 move, depth, black_bot.i, black_bot.prunings, elapsed, evaluation)
+        b_blunder = None
+        if last_b_eval is not None:
+            delta = evaluation - last_b_eval
+            if delta > BLUNDER_CP:
+                b_blunder = round(delta / 100, 2)
+                black_blunders += 1
+        last_b_eval = evaluation
 
-        # Apply black's move to the white bot's board state
+        blunder_str = f" BLUNDER(d={b_blunder:+.2f})" if b_blunder is not None else ""
+        lines.append(
+            f"[G{game_num:02d} M{half_move:03d} B/{black_label}] "
+            f"depth={depth} nodes={black_bot.i} prunings={black_bot.prunings} "
+            f"time={elapsed:.2f}s eval={_eval_str(evaluation)} move={_move_str(move)}{blunder_str}"
+        )
+
         gs = white_bot.makeMove(move, frfr=True)
         if gs in (staleMate, drawRep, blackWin, whiteWin):
             result_code = gs
-            log.info(
+            lines.append(
                 f"[G{game_num:02d}] After B move: "
                 f"{_result_label(result_code, white_label, black_label)}"
             )
             break
 
-        # Sanity check: both bots must agree on the position
         if white_bot.getPosition() != black_bot.getPosition():
-            log.warning(
+            lines.append(
                 f"[G{game_num:02d}] POSITION MISMATCH after half-move {half_move} — "
                 "state desync! Aborting game as draw."
             )
@@ -253,40 +243,60 @@ def run_game(
             break
 
     if result_code == -1:
-        log.info(f"[G{game_num:02d}] Move limit ({MAX_MOVES_PER_GAME}) reached -> DRAW")
+        lines.append(
+            f"[G{game_num:02d}] Move limit ({MAX_MOVES_PER_GAME}) reached -> DRAW"
+        )
 
-    # Compute the game winner from the perspective of bot1/bot2 (not color)
-    result_str = _result_label(result_code, white_label, black_label)
-    avg_d_white = round(
-        sum(bot1_depths if bot1_plays_white else bot2_depths) /
-        max(1, len(bot1_depths if bot1_plays_white else bot2_depths)), 1
-    )
-    avg_d_black = round(
-        sum(bot2_depths if bot1_plays_white else bot1_depths) /
-        max(1, len(bot2_depths if bot1_plays_white else bot1_depths)), 1
-    )
-    log.info(
+    result_str   = _result_label(result_code, white_label, black_label)
+    depths_white = bot1_depths if bot1_plays_white else bot2_depths
+    depths_black = bot2_depths if bot1_plays_white else bot1_depths
+    avg_d_w = round(sum(depths_white) / max(1, len(depths_white)), 1)
+    avg_d_b = round(sum(depths_black) / max(1, len(depths_black)), 1)
+    bot1_blunders = white_blunders if bot1_plays_white else black_blunders
+    bot2_blunders = black_blunders if bot1_plays_white else white_blunders
+
+    lines.append(
         f"=== GAME {game_num:02d} RESULT: {result_str} | "
         f"half_moves={half_move} | "
-        f"W({white_label}) avg_depth={avg_d_white} | "
-        f"B({black_label}) avg_depth={avg_d_black} ==="
+        f"W({white_label}) avg_depth={avg_d_w} blunders={white_blunders} | "
+        f"B({black_label}) avg_depth={avg_d_b} blunders={black_blunders} ==="
     )
 
     return (
+        game_num,
         result_code,
         half_move,
         bot1_depths, bot2_depths,
         bot1_nodes,  bot2_nodes,
         white_label, black_label,
+        bot1_blunders, bot2_blunders,
+        lines,
     )
+
+
+# ---------------------------------------------------------------------------
+# Top-level worker for multiprocessing (must be defined at module level)
+# ---------------------------------------------------------------------------
+
+def _run_game_worker(args: tuple) -> tuple:
+    """Spawn-safe worker: creates its own bot instances and suppresses bot prints."""
+    game_num, bot1_plays_white, time_limit = args
+    # Suppress the per-move console prints from botMove() to avoid interleaved output
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        b1 = chessBoard1()
+        b2 = chessBoard2()
+        return run_game(game_num, b1, b2, bot1_plays_white, time_limit)
+    finally:
+        sys.stdout = old_stdout
 
 
 # ---------------------------------------------------------------------------
 # Session runner
 # ---------------------------------------------------------------------------
 
-def run_session(n_games: int, time_limit: float) -> None:
-    """Run a full benchmark session of n_games games."""
+def run_session(n_games: int, time_limit: float, n_workers: Optional[int] = None) -> None:
     log, log_path = setup_logger()
     log.info(
         f"=== Benchmark started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ==="
@@ -295,75 +305,91 @@ def run_session(n_games: int, time_limit: float) -> None:
     log.info(f"Max half-moves per game: {MAX_MOVES_PER_GAME}")
     log.info("")
 
-    bot1 = chessBoard1()
-    bot2 = chessBoard2()
+    if n_workers is None:
+        n_workers = min(n_games, os.cpu_count() or 1)
+    n_workers = max(1, n_workers)
+
+    args_list = [
+        (game_num, game_num % 2 == 1, time_limit)
+        for game_num in range(1, n_games + 1)
+    ]
 
     # Session accumulators
-    bot1_wins  = 0
-    bot2_wins  = 0
-    draws      = 0
-
-    # Color-split win counters
-    bot1_wins_as_white = 0
-    bot1_wins_as_black = 0
-    bot2_wins_as_white = 0
-    bot2_wins_as_black = 0
-
+    bot1_wins = bot2_wins = draws = 0
+    bot1_wins_as_white = bot1_wins_as_black = 0
+    bot2_wins_as_white = bot2_wins_as_black = 0
     all_bot1_depths: List[int] = []
     all_bot2_depths: List[int] = []
     all_bot1_nodes:  List[int] = []
     all_bot2_nodes:  List[int] = []
     all_game_lengths: List[int] = []
+    total_bot1_blunders = 0
+    total_bot2_blunders = 0
 
-    game_results = []   # list of (result_code, white_label, black_label)
+    collected: Dict[int, tuple] = {}
+    games_done = 0
 
+    if n_workers == 1:
+        # Sequential: stream per-move logs in real time
+        b1 = chessBoard1()
+        b2 = chessBoard2()
+        for game_num, bot1_plays_white, tl in args_list:
+            result = run_game(game_num, b1, b2, bot1_plays_white, tl)
+            for line in result[-1]:
+                log.info(line)
+            collected[game_num] = result
+            games_done += 1
+            print(f"[{games_done}/{n_games} games done]", flush=True)
+    else:
+        # Parallel: buffer per-game logs; write them in order after all games finish
+        log.info(f"Running up to {n_workers} games in parallel...")
+        with multiprocessing.Pool(processes=n_workers) as pool:
+            for result in pool.imap_unordered(_run_game_worker, args_list):
+                collected[result[0]] = result
+                games_done += 1
+                print(f"[{games_done}/{n_games} games done]", flush=True)
+
+        # Write per-game logs to file in game-number order
+        for game_num in range(1, n_games + 1):
+            for line in collected[game_num][-1]:
+                log.info(line)
+
+    # ------------------------------------------------------------------
+    # Tally results
+    # ------------------------------------------------------------------
     for game_num in range(1, n_games + 1):
-        bot1_plays_white = (game_num % 2 == 1)
-
-        (
-            result_code,
-            half_moves,
-            b1_depths, b2_depths,
-            b1_nodes,  b2_nodes,
-            white_label, black_label,
-        ) = run_game(
-            game_num=game_num,
-            bot1=bot1,
-            bot2=bot2,
-            bot1_plays_white=bot1_plays_white,
-            time_limit=time_limit,
-            log=log,
-        )
+        (_, result_code, half_moves,
+         b1_depths, b2_depths,
+         b1_nodes,  b2_nodes,
+         white_label, black_label,
+         b1_blunders, b2_blunders,
+         _lines) = collected[game_num]
 
         all_bot1_depths.extend(b1_depths)
         all_bot2_depths.extend(b2_depths)
         all_bot1_nodes.extend(b1_nodes)
         all_bot2_nodes.extend(b2_nodes)
         all_game_lengths.append(half_moves)
-        game_results.append((result_code, white_label, black_label))
+        total_bot1_blunders += b1_blunders
+        total_bot2_blunders += b2_blunders
 
-        # Tally wins
         if result_code == whiteWin:
             if white_label == "bot1":
-                bot1_wins += 1
-                bot1_wins_as_white += 1
+                bot1_wins += 1; bot1_wins_as_white += 1
             else:
-                bot2_wins += 1
-                bot2_wins_as_white += 1
+                bot2_wins += 1; bot2_wins_as_white += 1
         elif result_code == blackWin:
             if black_label == "bot1":
-                bot1_wins += 1
-                bot1_wins_as_black += 1
+                bot1_wins += 1; bot1_wins_as_black += 1
             else:
-                bot2_wins += 1
-                bot2_wins_as_black += 1
+                bot2_wins += 1; bot2_wins_as_black += 1
         else:
             draws += 1
 
     # ------------------------------------------------------------------
     # Session summary
     # ------------------------------------------------------------------
-    total = bot1_wins + bot2_wins + draws
+    total  = bot1_wins + bot2_wins + draws
     b1_pct = 100 * bot1_wins / total if total else 0
     b2_pct = 100 * bot2_wins / total if total else 0
     d_pct  = 100 * draws      / total if total else 0
@@ -394,10 +420,13 @@ def run_session(n_games: int, time_limit: float) -> None:
     log.info(f"    Bot2 avg search depth   : {b2_avg_d}")
     log.info(f"    Bot1 avg nodes/move     : {b1_avg_n}")
     log.info(f"    Bot2 avg nodes/move     : {b2_avg_n}")
+    log.info("")
+    log.info("  Blunders (eval drop >150cp vs same side 2 half-moves ago):")
+    log.info(f"    Bot1 total blunders     : {total_bot1_blunders}")
+    log.info(f"    Bot2 total blunders     : {total_bot2_blunders}")
     log.info(f"    Avg game length (half-moves): {avg_game_len}")
     log.info("=" * 70)
 
-    # Determine winner
     if bot1_wins > bot2_wins:
         log.info("  VERDICT: Bot1 is stronger in this sample.")
     elif bot2_wins > bot1_wins:
@@ -405,9 +434,7 @@ def run_session(n_games: int, time_limit: float) -> None:
     else:
         log.info("  VERDICT: Tied — inconclusive with this sample size.")
 
-    # Margin-of-error note (approx 95% CI width for a proportion)
-    import math
-    p = bot1_wins / total if total else 0.5
+    p   = bot1_wins / total if total else 0.5
     moe = 1.96 * math.sqrt(p * (1 - p) / max(1, total)) * 100
     log.info(f"  95% CI margin of error on win%: ±{moe:.1f} pp  (n={total})")
     log.info("=" * 70)
@@ -430,6 +457,10 @@ def main() -> None:
         "--time-limit", type=float, default=0.5,
         help="Seconds allowed per move (default: 0.5)."
     )
+    parser.add_argument(
+        "--workers", type=int, default=None,
+        help="Parallel worker processes (default: cpu_count). Use 1 for sequential mode."
+    )
     args = parser.parse_args()
 
     if args.games % 2 != 0:
@@ -438,7 +469,7 @@ def main() -> None:
             "Bot1 will play one extra game as White. Consider an even number."
         )
 
-    run_session(n_games=args.games, time_limit=args.time_limit)
+    run_session(n_games=args.games, time_limit=args.time_limit, n_workers=args.workers)
 
 
 if __name__ == "__main__":

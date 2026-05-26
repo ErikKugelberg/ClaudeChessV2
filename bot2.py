@@ -546,6 +546,19 @@ class chessBoard2:
             if not self._stop_search and null_score >= beta:
                 return beta
 
+        # Futility pruning: at depth-1 nodes, compute static eval once.
+        # If eval already beats beta (stand-pat), return immediately.
+        # Otherwise, update alpha with the stand-pat score and mark quiet
+        # moves for skipping when they can't possibly raise alpha.
+        futility_eval = None
+        if remaining == 1 and not self._stop_search and not self._kingChecked(self.whitesMove):
+            futility_eval = self.evaluatePosition() if self.whitesMove else -self.evaluatePosition()
+            self.i += 1
+            if futility_eval >= beta:
+                self._ttable[ttKey] = (entry_depth, futility_eval, None)
+                return futility_eval
+            alpha = max(alpha, futility_eval)
+
         moves = self.getLegalMoves()
 
         if len(moves) == 0:
@@ -558,10 +571,14 @@ class chessBoard2:
             moves = self._sortMoves(moves, self.whitesMove, entry_depth, tt_move)
         else:
             newMoves = [move for move in moves if move.getAttacking() == 1]
-            if len(newMoves) != 0:
+            if newMoves:
+                newMoves.sort(key=lambda m: self._mvvLvaScore(m, entry_depth, tt_move), reverse=True)
                 moves = newMoves
 
         for move_idx, move in enumerate(moves):
+            # Futility pruning: skip quiet moves whose best case is still below alpha
+            if futility_eval is not None and move.getAttacking() == 0 and futility_eval + 250 < alpha:
+                continue
             rec = self._saveState(move)
             self.makeMove(move)
             _cur = self._toString(self.board)
