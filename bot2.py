@@ -280,7 +280,7 @@ class chessBoard2:
         self._history = [[0]*64 for _ in range(64)]
         self._killers = [[None, None] for _ in range(128)]
         self._stop_search = False
-        prevMove : Move
+        prevMove = None
         prevEval = -float('inf')
 
         moves = self.getLegalMoves()
@@ -301,7 +301,8 @@ class chessBoard2:
                     depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves)
             d += 1
             if ((time.time() - startTime) > timeLimit):
-                if prevEval > self.evaluation:  # timed out mid-search, use last complete result
+                # Search was interrupted: always use the last COMPLETE depth result
+                if self._stop_search and prevMove is not None:
                     self.evaluation = prevEval
                     move = prevMove
                 break
@@ -568,14 +569,14 @@ class chessBoard2:
                 score = 0  # Draw by repetition — score this move as draw, keep searching
             else:
                 # Late Move Reduction: try late quiet moves at reduced depth (no cascading).
-                # Skip LMR if the move gives check — check-giving moves can be critical.
-                gives_check = self._kingChecked(self.whitesMove)
-                if (allow_lmr and not gives_check and move_idx >= 3 and remaining >= 2
-                        and move.getAttacking() == 0 and not self._stop_search):
+                # _kingChecked is lazy: only called when all cheaper LMR conditions pass.
+                if (allow_lmr and move_idx >= 3 and remaining >= 2
+                        and move.getAttacking() == 0 and not self._stop_search
+                        and not self._kingChecked(self.whitesMove)):
+                    # LMR: probe at reduced depth with null window; re-search if it beats alpha
                     score = -self._recFindBestEval(remaining - 1, -alpha - 1, -alpha,
                                                     timeLimit=timeLimit, startTime=startTime,
                                                     allow_lmr=False)
-                    # If LMR didn't fail low, re-search at full depth
                     if not self._stop_search and score > alpha:
                         score = -self._recFindBestEval(remaining, -beta, -alpha,
                                                         timeLimit=timeLimit, startTime=startTime)
