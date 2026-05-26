@@ -340,31 +340,31 @@ class chessBoard2:
         if (self.whitesMove):
             for t in range(8):
                 for p in range(8):
-                    if (self.board[p*8 + t] < pieceDivider) and (self.board[p*8 + t] != empty):     
-                        board, nr = self._getMoves(t,p, rokad=not inCheck)                 
-                        currentMoves = board
-                        for x in range(8):
-                            for y in range(8):
-                                if currentMoves & (1 << (x + 8*y)):
-                                    move = Move(t,p,x,y)
-                                    if self._legalMove(move):
-                                        if self.board[x + y*8] != empty:
-                                            move.setAttacking()
-                                        moves.append(move)                  
+                    if (self.board[p*8 + t] < pieceDivider) and (self.board[p*8 + t] != empty):
+                        bb, _ = self._getMoves(t, p, rokad=not inCheck)
+                        while bb:
+                            bit = bb & -bb; bb ^= bit
+                            pos = bit.bit_length() - 1
+                            x, y = pos % 8, pos // 8
+                            move = Move(t, p, x, y)
+                            if self._legalMove(move):
+                                if self.board[x + y*8] != empty:
+                                    move.setAttacking()
+                                moves.append(move)
         else:
             for t in range(8):
                 for p in range(8):
                     if self.board[p*8 + t] > pieceDivider:
-                        board, nr = self._getMoves(t,p, rokad=not inCheck)                 
-                        currentMoves = board
-                        for x in range(8):
-                            for y in range(8):
-                                if currentMoves & (1 << (x + 8*y)):
-                                    move = Move(t,p,x,y)
-                                    if self._legalMove(move):
-                                        if self.board[x + y*8] != empty:
-                                            move.setAttacking()
-                                        moves.append(move)    
+                        bb, _ = self._getMoves(t, p, rokad=not inCheck)
+                        while bb:
+                            bit = bb & -bb; bb ^= bit
+                            pos = bit.bit_length() - 1
+                            x, y = pos % 8, pos // 8
+                            move = Move(t, p, x, y)
+                            if self._legalMove(move):
+                                if self.board[x + y*8] != empty:
+                                    move.setAttacking()
+                                moves.append(move)
         return moves
 
     # Set up the board to starting position
@@ -678,27 +678,70 @@ class chessBoard2:
                 self.blackKingPos = [idx % 8, idx // 8]
         return legal
 
-    # Checks if a king is checked
+    # Checks if a king is checked (ray-tracing from king position, ~4x faster than generating all enemy moves)
     def _kingChecked(self, checkWhiteKing) -> bool:
-        movesBoard = 0
         if checkWhiteKing:
-            kingCoord = self.whiteKingPos
-            for t in range(8):
-                for p in range(8):
-                    piece = self.board[p*8 + t]
-                    if piece > pieceDivider:
-                        board, nr = self._getMoves(t, p)
-                        movesBoard |= board
+            kx, ky = self.whiteKingPos
+            e_rq = (Brook, Bqueen)
+            e_bq = (Bbishop, Bqueen)
+            e_knight = Bknight
+            e_pawn   = Bpawn
+            e_king   = Bking
+            pawn_dy  = 1   # black pawns attack downward, so they sit above the white king
         else:
-            kingCoord = self.blackKingPos
-            for t in range(8):
-                for p in range(8):
-                    piece = self.board[p*8 + t]
-                    if 0 < piece < pieceDivider:
-                        board, nr = self._getMoves(t, p)
-                        movesBoard |= board
+            kx, ky = self.blackKingPos
+            e_rq = (Wrook, Wqueen)
+            e_bq = (Wbishop, Wqueen)
+            e_knight = Wknight
+            e_pawn   = Wpawn
+            e_king   = Wking
+            pawn_dy  = -1  # white pawns attack upward, so they sit below the black king
 
-        return bool(movesBoard & (1 << (kingCoord[0] + kingCoord[1]*8)))
+        # Rook / queen — horizontal and vertical rays
+        for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+            x, y = kx+dx, ky+dy
+            while 0 <= x <= 7 and 0 <= y <= 7:
+                p = self.board[y*8+x]
+                if p != empty:
+                    if p == e_rq[0] or p == e_rq[1]:
+                        return True
+                    break
+                x += dx; y += dy
+
+        # Bishop / queen — diagonal rays
+        for dx, dy in ((1,1),(1,-1),(-1,1),(-1,-1)):
+            x, y = kx+dx, ky+dy
+            while 0 <= x <= 7 and 0 <= y <= 7:
+                p = self.board[y*8+x]
+                if p != empty:
+                    if p == e_bq[0] or p == e_bq[1]:
+                        return True
+                    break
+                x += dx; y += dy
+
+        # Knights
+        for dx, dy in self.knightMoves:
+            x, y = kx+dx, ky+dy
+            if 0 <= x <= 7 and 0 <= y <= 7 and self.board[y*8+x] == e_knight:
+                return True
+
+        # Pawns (enemy pawns sit one rank in pawn_dy direction, on adjacent files)
+        py = ky + pawn_dy
+        if 0 <= py <= 7:
+            for px in (kx-1, kx+1):
+                if 0 <= px <= 7 and self.board[py*8+px] == e_pawn:
+                    return True
+
+        # Enemy king (adjacent squares)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                x, y = kx+dx, ky+dy
+                if 0 <= x <= 7 and 0 <= y <= 7 and self.board[y*8+x] == e_king:
+                    return True
+
+        return False
    
     # Follow a defined path on the board, setting the movesBoard to 1 along it until it runs into a piece
     def _iterateMovesW(self,x,y,xt,yt, newBoard=0x0000000000000000, nrMoves=0):
