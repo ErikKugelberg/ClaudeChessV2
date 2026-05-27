@@ -3,3 +3,5 @@ __pycache__/
 *.pyo
 logs/
 .claude/settings.local.json
+FuturePlans.txt
+stockfish.exe
