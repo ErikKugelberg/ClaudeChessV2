@@ -262,7 +262,7 @@ class chessBoard2:
 
         evaluation = (WSum - BSum)
 
-        # Based on what stockfish thinks at starting position:
+        # Tempo bonus: having the move is worth ~17 cp (calibrated from Stockfish at start pos)
         if self.whitesMove:
             evaluation += 17
         else:
@@ -279,26 +279,19 @@ class chessBoard2:
         self.lookUps = 0
         self._history = [[0]*64 for _ in range(64)]
         self._killers = [[None, None] for _ in range(128)]
+        self._ttable = LimitedSizeDict(max_size=100_000)  # clear per-move: cross-move entries contaminate different positions
         self._stop_search = False
         prevMove = None
         prevEval = -float('inf')
 
         moves = self.getLegalMoves()
         while True:
-            # Aspiration windows: narrow search window around previous result to prune more branches.
-            # Only use when we have a stable eval (not mate, not first iteration).
-            aw = 50
-            if d >= 3 and prevEval != -float('inf') and abs(prevEval) < 5000:
-                move, self.evaluation, moves = self.findBestMove(
-                    depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves,
-                    initial_alpha=prevEval - aw, initial_beta=prevEval + aw)
-                # On fail-low or fail-high, retry with full window
-                if not self._stop_search and (self.evaluation <= prevEval - aw or self.evaluation >= prevEval + aw):
-                    move, self.evaluation, moves = self.findBestMove(
-                        depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves)
-            else:
-                move, self.evaluation, moves = self.findBestMove(
-                    depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves)
+            # Clear TT before each depth: cross-iteration TT entries (odd-depth values returned
+            # by even-depth searches and vice versa) cause wrong evaluations due to parity swings.
+            # Move ordering is preserved via the sorted `moves` list from the previous iteration.
+            self._ttable = LimitedSizeDict(max_size=100_000)
+            move, self.evaluation, moves = self.findBestMove(
+                depthLimit=d, timeLimit=timeLimit, startTime=startTime, moves=moves)
             d += 1
             if ((time.time() - startTime) > timeLimit):
                 # Search was interrupted: always use the last COMPLETE depth result
@@ -465,12 +458,15 @@ class chessBoard2:
                 return None, 0, []  # Stalemate
 
         scores = []
+        best_move = None
+        best_score = -float('inf')
         for move in moves:
             rec = self._saveState(move)
             self.makeMove(move)
             _cur = self._toString(self.board)
             if (self.boardHistoryCounts.get(_cur, 0) > 2):
-                scores.append(0)  # Draw by repetition
+                score = 0
+                scores.append(score)
             else:
                 score = -self._recFindBestEval(depthLimit, -beta, -alpha, timeLimit=timeLimit, startTime=startTime)
                 if not self._stop_search:
@@ -478,17 +474,21 @@ class chessBoard2:
             self._undoMove(rec)
             if self._stop_search:
                 break
-            alpha = max(scores[-1], alpha)
+            # Track the best move via strict improvement only: moves evaluated later with a
+            # tight alpha-beta window can fail-high and return exactly alpha (a lower bound),
+            # not their true score. Using strict improvement avoids spurious ties with those.
+            if score > best_score:
+                best_score = score
+                best_move = move
+            alpha = max(score, alpha)
             if alpha >= beta:  # fail-high at root: stop (botMove will retry with wider window)
                 break
 
         if len(scores) == 0:
             return moves[0], -float('inf'), moves  # timed out before any move was evaluated
 
-        bestEval = max(scores)
-        indices = [index for index, score in enumerate(scores) if score == bestEval]
-        randomIndex = random.randint(0, len(indices)-1)
-        move = moves[indices[randomIndex]]
+        bestEval = best_score
+        move = best_move
 
         # Pad unevaluated moves with -inf so they sort to the end but the full list is preserved
         padded = scores + [-float('inf')] * (len(moves) - len(scores))
@@ -546,19 +546,6 @@ class chessBoard2:
             if not self._stop_search and null_score >= beta:
                 return beta
 
-        # Futility pruning: at depth-1 nodes, compute static eval once.
-        # If eval already beats beta (stand-pat), return immediately.
-        # Otherwise, update alpha with the stand-pat score and mark quiet
-        # moves for skipping when they can't possibly raise alpha.
-        futility_eval = None
-        if remaining == 1 and not self._stop_search and not self._kingChecked(self.whitesMove):
-            futility_eval = self.evaluatePosition() if self.whitesMove else -self.evaluatePosition()
-            self.i += 1
-            if futility_eval >= beta:
-                self._ttable[ttKey] = (entry_depth, futility_eval, None)
-                return futility_eval
-            alpha = max(alpha, futility_eval)
-
         moves = self.getLegalMoves()
 
         if len(moves) == 0:
@@ -570,15 +557,28 @@ class chessBoard2:
         if remaining != 0:
             moves = self._sortMoves(moves, self.whitesMove, entry_depth, tt_move)
         else:
-            newMoves = [move for move in moves if move.getAttacking() == 1]
-            if newMoves:
-                newMoves.sort(key=lambda m: self._mvvLvaScore(m, entry_depth, tt_move), reverse=True)
-                moves = newMoves
+            # Stand-pat at the capture-search frontier: the player can always choose NOT to capture.
+            # This prevents forced bad captures (e.g. exd5 after 1.e4 d5) from distorting scores.
+            stand_pat = self.evaluatePosition() if self.whitesMove else -self.evaluatePosition()
+            self.i += 1
+            if stand_pat >= beta:
+                return stand_pat
+            if stand_pat > alpha:
+                alpha = stand_pat
+            bestEval = max(bestEval, stand_pat)
+            moves = [m for m in moves if m.getAttacking() == 1]
+            # Filter losing captures at the search horizon: skip moves where we give away
+            # a piece worth >3× the victim (e.g. Qxpawn, Rxpawn). These look good statically
+            # because the opponent's recapture isn't evaluated at depth=0, but they're almost
+            # always unsound. Victim==0 passes through (en passant, edge cases).
+            moves = [m for m in moves
+                     if self.pValues[self.board[m.getY2()*8 + m.getX2()]] == 0
+                     or self.pValues[self.board[m.getY2()*8 + m.getX2()]] * 3
+                        >= self.pValues[self.board[m.getY1()*8 + m.getX1()]]]
+            if not moves:
+                return bestEval  # no captures: stand-pat is the answer
 
         for move_idx, move in enumerate(moves):
-            # Futility pruning: skip quiet moves whose best case is still below alpha
-            if futility_eval is not None and move.getAttacking() == 0 and futility_eval + 250 < alpha:
-                continue
             rec = self._saveState(move)
             self.makeMove(move)
             _cur = self._toString(self.board)
@@ -587,13 +587,14 @@ class chessBoard2:
             else:
                 # Late Move Reduction: try late quiet moves at reduced depth (no cascading).
                 # _kingChecked is lazy: only called when all cheaper LMR conditions pass.
-                if (allow_lmr and move_idx >= 3 and remaining >= 2
+                if (allow_lmr and move_idx >= 5 and remaining >= 3
                         and move.getAttacking() == 0 and not self._stop_search
                         and not self._kingChecked(self.whitesMove)):
-                    # LMR: probe at reduced depth with null window; re-search if it beats alpha
+                    # LMR: probe at reduced depth with null window; re-search if it beats alpha.
+                    # allow_null=False prevents null move firing inside already-reduced searches.
                     score = -self._recFindBestEval(remaining - 1, -alpha - 1, -alpha,
                                                     timeLimit=timeLimit, startTime=startTime,
-                                                    allow_lmr=False)
+                                                    allow_lmr=False, allow_null=False)
                     if not self._stop_search and score > alpha:
                         score = -self._recFindBestEval(remaining, -beta, -alpha,
                                                         timeLimit=timeLimit, startTime=startTime)
