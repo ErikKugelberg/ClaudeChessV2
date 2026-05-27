@@ -143,6 +143,8 @@ class chessBoard2:
         WkingCoord = [-1,-1]
         BPawnArray = 0x0000000000000000
         WPawnArray = 0x0000000000000000
+        WbishopCount = 0
+        BbishopCount = 0
 
         lateGame = (64 - self.board.count(0)) < 15
         for x in range(8):
@@ -152,7 +154,10 @@ class chessBoard2:
                     if piece == Bpawn:
                         BPawnArray |= 1 << (x + y*8)
                         BSum += self.pawnWBL[y*8 + x] if lateGame else self.pawnWBE[y*8 + x]
-                    elif piece == Bbishop or piece == Bknight:
+                    elif piece == Bbishop:
+                        BSum += self.bishKnighWB[y*8 + x]
+                        BbishopCount += 1
+                    elif piece == Bknight:
                         BSum += self.bishKnighWB[y*8 + x]
                     elif piece == Brook and not lateGame:
                         BSum += self.rookWBE[y*8 + x]
@@ -169,7 +174,10 @@ class chessBoard2:
                     if piece == Wpawn:
                         WPawnArray |= 1 << (x + y*8)
                         WSum += self.pawnWBL[(7-y)*8 + x] if lateGame else self.pawnWBE[(7-y)*8 + x]
-                    elif piece == Wbishop or piece == Wknight:
+                    elif piece == Wbishop:
+                        WSum += self.bishKnighWB[(7-y)*8 + x]
+                        WbishopCount += 1
+                    elif piece == Wknight:
                         WSum += self.bishKnighWB[(7-y)*8 + x]
                     elif piece == Wrook and not lateGame:
                         WSum += self.rookWBE[(7-y)*8 + x]
@@ -227,7 +235,7 @@ class chessBoard2:
             if (BPawnArray & fm) and not (BPawnArray & adj):
                 BSum -= 20
 
-            # Rook open/semi-open file bonus
+            # Rook open/semi-open file bonus + 7th-rank bonus
             for y in range(8):
                 piece = self.board[y * 8 + x]
                 if piece == Wrook:
@@ -235,10 +243,14 @@ class chessBoard2:
                         WSum += 50
                     elif w_no_pawn:
                         WSum += 25
+                    if y == 6:  # 7th rank: cuts off enemy king, attacks pawns
+                        WSum += 25
                 elif piece == Brook:
                     if w_no_pawn and b_no_pawn:
                         BSum += 50
                     elif b_no_pawn:
+                        BSum += 25
+                    if y == 1:  # 7th rank for black (white's 2nd rank)
                         BSum += 25
 
             # Passed pawn bonus
@@ -248,6 +260,30 @@ class chessBoard2:
                     WSum += self._PASSED_BONUS[y]
                 if (BPawnArray & idx_bit) and not (WPawnArray & (fa & self._RANKS_BEHIND[y])):
                     BSum += self._PASSED_BONUS[7 - y]
+
+        # Bishop pair bonus: having both bishops is worth ~30 cp in open/semi-open positions
+        if WbishopCount >= 2:
+            WSum += 30
+        if BbishopCount >= 2:
+            BSum += 30
+
+        # King safety: pawn shield (middlegame only — in endgame king should be active)
+        if not lateGame:
+            wx, wy = WkingCoord
+            bx, by = BkingCoord
+            for dx in (-1, 0, 1):
+                sx = wx + dx
+                if 0 <= sx < 8:
+                    if wy + 1 < 8 and (WPawnArray & (1 << (sx + (wy + 1) * 8))):
+                        WSum += 15  # pawn on the rank immediately ahead
+                    elif wy + 2 < 8 and (WPawnArray & (1 << (sx + (wy + 2) * 8))):
+                        WSum += 7   # pawn two ranks ahead (advanced but still offers cover)
+                sx = bx + dx
+                if 0 <= sx < 8:
+                    if by - 1 >= 0 and (BPawnArray & (1 << (sx + (by - 1) * 8))):
+                        BSum += 15
+                    elif by - 2 >= 0 and (BPawnArray & (1 << (sx + (by - 2) * 8))):
+                        BSum += 7
 
         if (BkingCoord[0] == -1) or (WkingCoord[0] == -1):
             print(self.board)
@@ -967,10 +1003,12 @@ class chessBoard2:
     def _mvvLvaScore(self, move, depth=0, tt_move=None):
         if tt_move is not None and move == tt_move:
             return 2_000_000
-        victim = self.board[move.getX2() + move.getY2()*8]
-        if victim != empty:
+        if move.getAttacking() == 1:
+            victim = self.board[move.getX2() + move.getY2()*8]
             attacker = self.board[move.getX1() + move.getY1()*8]
-            return 1_000_000 + 10 * self._MVV_LVA_VALUES[victim] - self._MVV_LVA_VALUES[attacker]
+            # En passant: destination square is empty; treat captured piece as a pawn
+            victim_val = self._MVV_LVA_VALUES[victim] if victim != empty else self._MVV_LVA_VALUES[Wpawn]
+            return 1_000_000 + 10 * victim_val - self._MVV_LVA_VALUES[attacker]
         if move == self._killers[depth][0]:
             return 900_000
         if move == self._killers[depth][1]:
@@ -982,9 +1020,5 @@ class chessBoard2:
         moves.sort(key=lambda m: self._mvvLvaScore(m, depth, tt_move), reverse=True)
         return moves
 
-    # Compress chess board to string for map 1200, 
     def _toString(self, board):
-        code = 0x0000000000000000000000000000000000000000000000000000000000000000
-        for i, p in enumerate(board):
-            code |= p << i*4
-        return code
+        return bytes(board)

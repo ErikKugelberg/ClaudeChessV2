@@ -64,14 +64,27 @@ bot2 uses **negamax** (not dual-branch minimax). Scores are always relative to t
 
 **Implemented and working:**
 - Incremental undo (`UndoRecord`) and king position tracking
+- `nonPawnCount` tracked incrementally in `_movePieces` / `_undoMove` (avoids O(64) scan per null-move guard)
+- `boardHistoryCounts` O(1) dict alongside `boardHistory` list (avoids O(game_length) `.count()` per node)
 - MVV-LVA capture ordering + history heuristic for quiet moves
-- Killer move heuristic (2 killers per depth, reset each `botMove()`)
-- TT hash-move ordering (3-tuple: depth, eval, best_move)
-- Evaluation: passed pawns, rooks on open/semi-open files, isolated pawn penalty
+- Killer move heuristic (2 killers per depth, 128-slot array, reset each `botMove()`)
+- TT hash-move ordering (3-tuple: depth, eval, best_move); 2_000_000 priority in `_sortMoves`
+- TT cleared per-iteration in `botMove()`: prevents cross-depth parity contamination (odd-depth tempo +17 vs even-depth −17 causes ~86 cp swing that corrupts cross-depth TT hits)
+- `findBestMove` strict improvement tracking (`if score > best_score`) prevents fail-high lower-bounds from spuriously displacing the true best move
+- Null move pruning (negamax, R=2, placed BEFORE `getLegalMoves()` so pruned nodes skip the expensive call; guards: `remaining > R`, not in check, `nonPawnCount > 4`)
+- LMR — Late Move Reductions (thresholds: `move_idx ≥ 5`, `remaining ≥ 3`, quiet move, not in check; probe with `allow_null=False` to prevent cascading null move inside LMR)
+- Stand-pat at `remaining==0`: player can choose not to capture; returns early if `stand_pat ≥ beta`; filters losing captures (`victim_value × 3 < attacker_value`)
+- Evaluation: passed pawns (rank-scaled bonus), rooks on open/semi-open files (+50/+25), isolated pawn penalty (−20), doubled pawn penalty, bishop pair bonus (+30 cp), king safety pawn shield (+15 for pawn immediately ahead, +7 for pawn two ranks ahead, middlegame only)
+- En passant MVV-LVA fix: en passant captures now correctly ordered with other captures (use pawn value as victim_val since destination square is empty)
+- `_toString` uses `bytes(board)` instead of big-integer bit-shifting: 18× faster (0.25µs vs 4.5µs per call)
 
 **Reverted — do not re-implement without fixing the root cause:**
-- **Quiescence search** (standalone): `getLegalMoves()` and `evaluatePosition()` are too expensive at every leaf; tested at qdepth 1–4, all produced 0% win rate. Now viable again with negamax — attempt using `_quiesce(alpha, beta)` with stand-pat.
-- **Null move pruning**: The dual-branch minimax structure caused incorrect cutoffs (now moot since negamax refactor). Still risky — needs zugzwang guard (piece count > 4) and no consecutive null moves.
+- **Quiescence search** (all three attempts, including negamax with stand-pat): `evaluatePosition()` and `getLegalMoves()` are too expensive per quiescence node. Even with stand-pat pruning, `evaluatePosition()` cost at every remaining==0 node starves the main IDA* loop. Result: 0% win rate across all variants (qdepth 1–4, standalone, negamax). Do NOT retry without first replacing `_getMoves()`-based mobility counting in `evaluatePosition()` with precomputed bitboard attack tables.
+- **Aspiration windows**: ±50 cp window always fails due to ~86 cp parity oscillation between even/odd depths; causes 2× work and TT contamination (narrow-window stale entries pollute full-window retry). Do NOT re-implement.
+- **PVS (Principal Variation Search)**: Python function call overhead (~0.1–0.5 ms/call) exceeds node-saving benefit. Result: 30% win rate (down from 85%). Do NOT implement.
+- **Proper TT node types** (exact/lower/upper bound): The "incorrect" all-exact TT provides faster cutoffs. Correct node types cause positions that previously returned immediately to continue searching — more nodes, fewer iterations. Result: 0% wins in first 2 games. The current "incorrect" TT is actually stronger. Do NOT change.
+- **Futility pruning** (`remaining==1`): Unsound without quiescence search. `evaluatePosition()` at remaining==1 is not a valid lower bound when opponent can immediately recapture. Result: 20–40% win rate. Do NOT implement without quiescence.
+- **History malus** (quiet moves that fail low get `history -= entry_depth`): Causes ordering regression — the same quiet move can be good in some subtrees and bad in others; malus from one context penalizes it in unrelated contexts. Result: search depth drops from 6.6 to ~4 (completed depth 3), clearly worse. Do NOT re-implement.
 
 ### GUI — `chessViewer.py`
 
