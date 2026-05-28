@@ -594,14 +594,27 @@ HTML = f"""<!DOCTYPE html>
   <button id="btn-play-again">Play Again</button>
 </div>
 
+<!-- Early error reporter — catches parse/runtime errors in utils-src and engine-src -->
+<script>
+window.onerror = function(msg, src, line, col, err) {{
+    var d = document.createElement('div');
+    d.style.cssText = 'position:fixed;top:0;left:0;right:0;background:#c00;color:#fff;padding:10px;font-size:13px;z-index:9999;white-space:pre-wrap;word-break:break-all;font-family:monospace';
+    d.textContent = 'JS Error (line ' + line + '): ' + msg + (err && err.stack ? '\\n' + err.stack : '');
+    document.body.prepend(d);
+    return false;
+}};
+</script>
+
 <!-- utils.js — executed as script AND readable as text for the worker blob -->
 <script type="text/javascript" id="utils-src">
 {utils_src}
 </script>
 
-<!-- engine.js — executed as script AND readable as text for the worker blob -->
+<!-- engine.js — wrapped in IIFE so its const declarations don't conflict with utils.js globals -->
 <script type="text/javascript" id="engine-src">
+(function() {{
 {engine_src}
+}})();
 </script>
 
 <script>
