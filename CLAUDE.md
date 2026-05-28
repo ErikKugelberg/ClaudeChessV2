@@ -21,6 +21,7 @@ ClaudeChessV2/
 ├── bot1.py, bot2.py, botFighter.py, chessViewer.py  ← runnable scripts
 ├── utils.py          ← shared types/constants (must stay in root; bot1.py imports it)
 ├── CLAUDE.md, README.md, .gitignore, stockfish.exe
+├── chess_mobile/     ← mobile web UI (see section below)
 ├── docs/             ← diagrams, PDF report, FuturePlans.txt
 ├── logs/             ← all benchmark .log files (botFighter writes here automatically)
 └── tools/            ← utility/debug scripts (attack_table_diagram.py, evalTest.py, etc.)
@@ -99,6 +100,63 @@ bot2 uses **negamax** (not dual-branch minimax). Scores are always relative to t
 - **Proper TT node types** (exact/lower/upper bound): The "incorrect" all-exact TT provides faster cutoffs. Correct node types cause positions that previously returned immediately to continue searching — more nodes, fewer iterations. Result: 0% wins in first 2 games. The current "incorrect" TT is actually stronger. Do NOT change.
 - **Futility pruning** (`remaining==1`): Previously unsound without quiescence. Quiescence is now in place, so futility may be implementable. Previously tested: 20–40% win rate without quiescence.
 - **History malus** (quiet moves that fail low get `history -= entry_depth`): Causes ordering regression — the same quiet move can be good in some subtrees and bad in others; malus from one context penalizes it in unrelated contexts. Result: search depth drops from 6.6 to ~4 (completed depth 3), clearly worse. Do NOT re-implement.
+
+### Mobile Web UI — `chess_mobile/`
+
+A single self-contained HTML file playable in any mobile browser — no server, no internet, no installation.
+
+**Files:**
+```
+chess_mobile/
+├── build_html.py     ← assembler script; always edit this, never edit chess_mobile.html directly
+├── utils.js          ← JS port of utils.py (Move, LimitedSizeDict, piece constants)
+├── engine.js         ← JS port of bot2.py (ChessEngine class, full search + eval)
+├── chess_mobile.html ← generated output (~67 KB); open directly in any browser
+├── test_utils.js     ← Node.js unit tests for utils.js
+└── test_engine.js    ← Node.js unit tests for engine.js
+```
+
+**Build:**
+```powershell
+python chess_mobile/build_html.py
+```
+
+**Run tests (requires Node.js):**
+```powershell
+node chess_mobile/test_utils.js
+node chess_mobile/test_engine.js
+```
+
+**Architecture:**
+- `build_html.py` reads `utils.js` + `engine.js` and inlines them into the HTML template as `<script id="utils-src">` / `<script id="engine-src">`.
+- The bot runs in a **Web Worker** (blob URL built from the two inlined scripts + a handler stub), keeping the UI responsive during search.
+- Game JS reads the two script tags' `.textContent` to construct the worker blob at runtime.
+
+**Critical browser gotcha — IIFE wrapper:**
+`utils.js` and `engine.js` both declare `const empty`, `const Move`, etc. at their top level. In browsers, all `<script>` tags share the same global lexical environment, so the second script's `const` declarations throw `SyntaxError: Identifier 'empty' has already been declared`. Fix: `build_html.py` wraps the engine-src content in an IIFE:
+```js
+(function() {
+  /* engine.js content */
+})();
+```
+Do NOT remove this wrapper. It is also harmless inside the worker blob (worker combines both scripts in one realm; the IIFE keeps engine's consts function-scoped).
+
+**UI features:**
+- Play as White or Black against the bot, or watch **Bot vs Bot** (engine drives both sides automatically).
+- Time options: Fast (0.1 s) / Normal (1 s) / Slow (10 s) per move.
+- Board flips to always show the human's side at the bottom.
+- Legal move dots/rings on tap, last-move highlight, check indicator, result banner.
+
+**engine.js exports (dual-environment pattern):**
+```js
+const _engineExports = { ChessEngine };
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = _engineExports;   // Node.js (tests, require())
+} else {
+    Object.assign(typeof globalThis !== 'undefined' ? globalThis : self, _engineExports);
+}
+```
+The import block at the top of `engine.js` uses the same pattern to pull from `require('./utils.js')` in Node and from the global object in the browser/worker.
 
 ### GUI — `chessViewer.py`
 

@@ -268,6 +268,7 @@ function _getWorker() {
 // ── Game state ─────────────────────────────────────────────────────────────────
 const engine   = new ChessEngine();
 let playWhite  = true;   // human plays white
+let botVsBot   = false;
 let thinking   = false;
 let gameOver   = false;
 let selected   = -1;     // selected board square index, -1 = none
@@ -354,7 +355,7 @@ function renderBoard() {
 
 // ── Click / tap handling ───────────────────────────────────────────────────────
 function onSquareClick(sq) {
-    if (thinking || gameOver) return;
+    if (thinking || gameOver || botVsBot) return;
     if (engine.whitesMove !== playWhite) return;  // not human's turn
 
     // Clicking the selected square deselects
@@ -464,6 +465,7 @@ function onWorkerMessage(evt) {
     updateInfo();
 
     if (gState !== onGoing) handleGameOver(gState);
+    else if (botVsBot) startBotThinking();
 }
 
 function setThinking(val) {
@@ -496,8 +498,8 @@ function startNewGame() {
     updateStatus();
     updateInfo();
 
-    // If human plays black, bot moves first
-    if (!playWhite) startBotThinking();
+    // Bot-vs-bot: engine drives both sides; human-as-black: bot goes first
+    if (botVsBot || !playWhite) startBotThinking();
 }
 
 function handleGameOver(state) {
@@ -533,15 +535,26 @@ function updateInfo() {
 document.getElementById('btn-new').addEventListener('click', startNewGame);
 
 document.getElementById('btn-white').addEventListener('click', () => {
+    botVsBot  = false;
     playWhite = true;
     document.getElementById('btn-white').classList.add('active');
     document.getElementById('btn-black').classList.remove('active');
+    document.getElementById('btn-bot').classList.remove('active');
     startNewGame();
 });
 document.getElementById('btn-black').addEventListener('click', () => {
+    botVsBot  = false;
     playWhite = false;
     document.getElementById('btn-white').classList.remove('active');
     document.getElementById('btn-black').classList.add('active');
+    document.getElementById('btn-bot').classList.remove('active');
+    startNewGame();
+});
+document.getElementById('btn-bot').addEventListener('click', () => {
+    botVsBot = true;
+    document.getElementById('btn-white').classList.remove('active');
+    document.getElementById('btn-black').classList.remove('active');
+    document.getElementById('btn-bot').classList.add('active');
     startNewGame();
 });
 
@@ -579,13 +592,14 @@ HTML = f"""<!DOCTYPE html>
 <div id="controls">
   <button id="btn-new">New Game</button>
   <select id="sel-diff" title="Bot thinking time">
-    <option value="0.3">Easy (0.3 s)</option>
-    <option value="1.0" selected>Medium (1 s)</option>
-    <option value="3.0">Hard (3 s)</option>
+    <option value="0.1">Fast (0.1 s)</option>
+    <option value="1.0" selected>Normal (1 s)</option>
+    <option value="10.0">Slow (10 s)</option>
   </select>
   <div class="side-btns">
     <button class="side-btn active" id="btn-white">White</button>
     <button class="side-btn"        id="btn-black">Black</button>
+    <button class="side-btn"        id="btn-bot">Bot vs Bot</button>
   </div>
 </div>
 
