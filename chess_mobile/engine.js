@@ -528,7 +528,7 @@ class ChessEngine {
         else this.boardHistoryCounts[bh] = cnt;
     }
 
-    _toString() { return this.board.join(','); }
+    _toString() { return this.board.join(',') + (this.whitesMove ? 'w' : 'b'); }
 
     // ── Position evaluation ───────────────────────────────────────────────────
 
@@ -868,7 +868,7 @@ class ChessEngine {
 
             const cur = this._toString();
             let score;
-            if ((this.boardHistoryCounts[cur] || 0) > 2) {
+            if ((this.boardHistoryCounts[cur] || 0) > 1) {
                 score = 0;
             } else if (allowLmr && moveIdx>=5 && remaining>=3 && move.getAttacking()===0
                         && !this._stop_search && !this._kingChecked(this.whitesMove)) {
@@ -917,7 +917,7 @@ class ChessEngine {
             this.makeMove(move);
             const cur = this._toString();
             let score;
-            if ((this.boardHistoryCounts[cur] || 0) > 2) {
+            if ((this.boardHistoryCounts[cur] || 0) > 1) {
                 score = 0; scores.push(score);
             } else {
                 score = -this._recFindBestEval(depthLimit, -beta, -alpha, timeLimitMs, startTime);
