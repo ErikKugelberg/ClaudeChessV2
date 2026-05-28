@@ -600,13 +600,14 @@ class chessBoard2:
                 move = Move(tx, ty, dx2, dy2)
 
                 dest_pc = board[dest]
-                if dest_pc != empty:
+                is_ep = is_pawn and ep_x != -1 and dest_pc == empty and dx2 != tx
+                if dest_pc != empty or is_ep:
                     move.setAttacking()
 
                 # En passant: diagonal pawn move to an empty square.  Even when the
                 # pawn is not pinned, en passant can expose a rank pin (both the moving
                 # pawn and the captured pawn leave the same rank), so always check it.
-                if must_check or (is_pawn and ep_x != -1 and dest_pc == empty and dx2 != tx):
+                if must_check or is_ep:
                     if not self._legalMove(move):
                         continue
                 moves.append(move)
@@ -758,6 +759,50 @@ class chessBoard2:
 
         return move, bestEval, newMoves
 
+    # Quiescence search: stand-pat + recursive capture search until no captures remain.
+    # Called at depth==0 to resolve tactical sequences before returning a static eval.
+    def _quiesce(self, alpha, beta, timeLimit, startTime):
+        if self._stop_search:
+            return -float('inf')
+        if (time.time() - startTime) > timeLimit:
+            self._stop_search = True
+            return -float('inf')
+
+        stand_pat = self.evaluatePosition() if self.whitesMove else -self.evaluatePosition()
+        self.i += 1
+
+        if stand_pat >= beta:
+            return stand_pat
+        if stand_pat > alpha:
+            alpha = stand_pat
+
+        moves = self.getLegalMoves()
+        captures = [m for m in moves if m.getAttacking() == 1]
+        # Skip clearly losing captures (same SEE approximation as the main search horizon filter)
+        captures = [m for m in captures
+                    if self.pValues[self.board[m.getY2()*8 + m.getX2()]] == 0
+                    or self.pValues[self.board[m.getY2()*8 + m.getX2()]] * 3
+                       >= self.pValues[self.board[m.getY1()*8 + m.getX1()]]]
+        captures.sort(key=lambda m: self._mvvLvaScore(m), reverse=True)
+
+        best = stand_pat
+        for move in captures:
+            rec = self._saveState(move)
+            self.makeMove(move)
+            score = -self._quiesce(-beta, -alpha, timeLimit, startTime)
+            self._undoMove(rec)
+
+            if self._stop_search:
+                break
+            if score > best:
+                best = score
+            if score > alpha:
+                alpha = score
+            if alpha >= beta:
+                break
+
+        return best
+
     # Returns the best eval of a certain move, given the following moves (negamax)
     def _recFindBestEval(self, depth, alpha, beta, timeLimit, startTime, allow_null=True, allow_lmr=True):
         if self._stop_search:
@@ -765,6 +810,11 @@ class chessBoard2:
         if (time.time() - startTime) > timeLimit:
             self._stop_search = True
             return -float('inf')
+
+        # Quiescence search at leaf nodes: resolves captures before returning static eval.
+        # Placed before TT lookup to avoid a wasted hash lookup at every leaf.
+        if depth == 0:
+            return self._quiesce(alpha, beta, timeLimit, startTime)
 
         entry_depth = depth
 
@@ -779,12 +829,6 @@ class chessBoard2:
             if stored_depth >= entry_depth:
                 self.lookUps += 1
                 return stored_eval
-
-        if depth == 0:
-            self.i += 1
-            eval_val = self.evaluatePosition() if self.whitesMove else -self.evaluatePosition()
-            self._ttable[ttKey] = (0, eval_val, None)
-            return eval_val
 
         bestEval = -float('inf')
         remaining = depth - 1
