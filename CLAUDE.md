@@ -14,6 +14,18 @@ python chessViewer.py
 
 Both scripts require `matplotlib`, `numpy`, and standard library only.
 
+## Folder Layout
+
+```
+ClaudeChessV2/
+├── bot1.py, bot2.py, botFighter.py, chessViewer.py  ← runnable scripts
+├── utils.py          ← shared types/constants (must stay in root; bot1.py imports it)
+├── CLAUDE.md, README.md, .gitignore, stockfish.exe
+├── docs/             ← diagrams, PDF report, FuturePlans.txt
+├── logs/             ← all benchmark .log files (botFighter writes here automatically)
+└── tools/            ← utility/debug scripts (attack_table_diagram.py, evalTest.py, etc.)
+```
+
 ## Architecture
 
 The project is a Python chess engine with two bot implementations that compete against each other.
@@ -77,9 +89,11 @@ bot2 uses **negamax** (not dual-branch minimax). Scores are always relative to t
 - Evaluation: passed pawns (rank-scaled bonus), rooks on open/semi-open files (+50/+25), isolated pawn penalty (−20), doubled pawn penalty, bishop pair bonus (+30 cp), king safety pawn shield (+15 for pawn immediately ahead, +7 for pawn two ranks ahead, middlegame only)
 - En passant MVV-LVA fix: en passant captures now correctly ordered with other captures (use pawn value as victim_val since destination square is empty)
 - `_toString` uses `bytes(board)` instead of big-integer bit-shifting: 18× faster (0.25µs vs 4.5µs per call)
+- Precomputed attack tables in `evaluatePosition()`: `_KNIGHT_ATTACKS[64]`, `_KING_ATTACKS[64]`, `_WPAWN_ATTACKS[64]`, `_BPAWN_ATTACKS[64]` (bitboards per square), `_ROOK_RAYS[64]`, `_BISHOP_RAYS[64]`, `_QUEEN_RAYS[64]` (pre-stored index lists per ray). Eliminated all `_getMoves()` calls from eval. Avg depth improved 7.12→7.57.
+- **Absolute pin detection in `getLegalMoves()`**: Pre-computes pinned squares via O(64) ray-trace from king before iterating candidates. Non-pinned, non-king pieces skip `_legalMove()` entirely (~20 saved calls per node). En passant captures always check legality (can expose rank pin). King moves and pinned pieces still call `_legalMove()` as before.
 
 **Reverted — do not re-implement without fixing the root cause:**
-- **Quiescence search** (all three attempts, including negamax with stand-pat): `evaluatePosition()` and `getLegalMoves()` are too expensive per quiescence node. Even with stand-pat pruning, `evaluatePosition()` cost at every remaining==0 node starves the main IDA* loop. Result: 0% win rate across all variants (qdepth 1–4, standalone, negamax). Do NOT retry without first replacing `_getMoves()`-based mobility counting in `evaluatePosition()` with precomputed bitboard attack tables.
+- **Quiescence search** (all three attempts, including negamax with stand-pat): `evaluatePosition()` and `getLegalMoves()` are too expensive per quiescence node. Even with stand-pat pruning, `evaluatePosition()` cost at every remaining==0 node starves the main IDA* loop. Result: 0% win rate across all variants (qdepth 1–4, standalone, negamax). `evaluatePosition()` bottleneck is now solved (precomputed attack tables). `getLegalMoves()` bottleneck is now substantially reduced (pin detection skips ~20 `_legalMove()` calls per node). Re-testing quiescence search may now be viable.
 - **Aspiration windows**: ±50 cp window always fails due to ~86 cp parity oscillation between even/odd depths; causes 2× work and TT contamination (narrow-window stale entries pollute full-window retry). Do NOT re-implement.
 - **PVS (Principal Variation Search)**: Python function call overhead (~0.1–0.5 ms/call) exceeds node-saving benefit. Result: 30% win rate (down from 85%). Do NOT implement.
 - **Proper TT node types** (exact/lower/upper bound): The "incorrect" all-exact TT provides faster cutoffs. Correct node types cause positions that previously returned immediately to continue searching — more nodes, fewer iterations. Result: 0% wins in first 2 games. The current "incorrect" TT is actually stronger. Do NOT change.

@@ -110,6 +110,58 @@ class chessBoard2:
     # Passed pawn rank bonus (index = white-perspective rank 0-7)
     _PASSED_BONUS = [0, 0, 0, 10, 20, 35, 60, 100]
 
+    # --- Precomputed attack/ray tables built once at class-load time ---
+    # For each square: bitboard of squares that piece type attacks (board-state-independent).
+    # For sliding pieces: list of ray index-lists (each ray is a list of board indices in order
+    # outward from the piece square, within board bounds — no bounds checking needed in eval loop).
+    def _build_attack_tables():
+        KN = [0]*64; KG = [0]*64; WP = [0]*64; BP = [0]*64
+        kn_off = [(-2,1),(-1,2),(1,2),(2,1),(2,-1),(1,-2),(-1,-2),(-2,-1)]
+        for sq in range(64):
+            x, y = sq%8, sq//8
+            kb = 0
+            for dx, dy in kn_off:
+                nx, ny = x+dx, y+dy
+                if 0<=nx<=7 and 0<=ny<=7: kb |= 1<<(ny*8+nx)
+            KN[sq] = kb
+            gb = 0
+            for dx in (-1,0,1):
+                for dy in (-1,0,1):
+                    if dx==0 and dy==0: continue
+                    nx, ny = x+dx, y+dy
+                    if 0<=nx<=7 and 0<=ny<=7: gb |= 1<<(ny*8+nx)
+            KG[sq] = gb
+            wp = 0
+            if y < 7:
+                if x > 0: wp |= 1<<((y+1)*8+x-1)
+                if x < 7: wp |= 1<<((y+1)*8+x+1)
+            WP[sq] = wp
+            bp = 0
+            if y > 0:
+                if x > 0: bp |= 1<<((y-1)*8+x-1)
+                if x < 7: bp |= 1<<((y-1)*8+x+1)
+            BP[sq] = bp
+        RK = [[] for _ in range(64)]; BS = [[] for _ in range(64)]; QN = [[] for _ in range(64)]
+        for sq in range(64):
+            x, y = sq%8, sq//8
+            rr = []
+            for dx, dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                ray = []; nx, ny = x+dx, y+dy
+                while 0<=nx<=7 and 0<=ny<=7:
+                    ray.append(ny*8+nx); nx+=dx; ny+=dy
+                if ray: rr.append(ray)
+            br = []
+            for dx, dy in ((1,1),(1,-1),(-1,1),(-1,-1)):
+                ray = []; nx, ny = x+dx, y+dy
+                while 0<=nx<=7 and 0<=ny<=7:
+                    ray.append(ny*8+nx); nx+=dx; ny+=dy
+                if ray: br.append(ray)
+            RK[sq] = rr; BS[sq] = br; QN[sq] = rr + br
+        return KN, KG, WP, BP, RK, BS, QN
+    (_KNIGHT_ATTACKS, _KING_ATTACKS, _WPAWN_ATTACKS, _BPAWN_ATTACKS,
+     _ROOK_RAYS, _BISHOP_RAYS, _QUEEN_RAYS) = _build_attack_tables()
+    del _build_attack_tables
+
     def __init__(self):
         self.board = []
         self.whitesMove = True              # True if it is whites move
@@ -137,59 +189,183 @@ class chessBoard2:
         BSum = 0
         Wattacks = 0
         Battacks = 0
-        BmovesBoard = 0x0000000000000000
-        WmovesBoard = 0x0000000000000000
-        BkingCoord = [-1,-1]
-        WkingCoord = [-1,-1]
-        BPawnArray = 0x0000000000000000
-        WPawnArray = 0x0000000000000000
+        BmovesBoard = 0
+        WmovesBoard = 0
+        BkingCoord = (-1, -1)
+        WkingCoord = (-1, -1)
+        BPawnArray = 0
+        WPawnArray = 0
         WbishopCount = 0
         BbishopCount = 0
 
         lateGame = (64 - self.board.count(0)) < 15
-        for x in range(8):
-            for y in range(8):
-                piece = self.board[y*8 + x]
-                if piece > pieceDivider:
-                    if piece == Bpawn:
-                        BPawnArray |= 1 << (x + y*8)
-                        BSum += self.pawnWBL[y*8 + x] if lateGame else self.pawnWBE[y*8 + x]
-                    elif piece == Bbishop:
-                        BSum += self.bishKnighWB[y*8 + x]
-                        BbishopCount += 1
-                    elif piece == Bknight:
-                        BSum += self.bishKnighWB[y*8 + x]
-                    elif piece == Brook and not lateGame:
-                        BSum += self.rookWBE[y*8 + x]
-                    elif piece == Bking:
-                        BSum += self.kingWBL[y*8 + x] if lateGame else self.kingWBE[y*8 + x]
-                        BkingCoord = [x, y]
-                    elif piece == Bqueen and not lateGame:
-                        BSum += self.queenWBE[y*8 + x]
-                    BSum += self.pValues[piece]
-                    movesBoard, cnt = self._getMoves(x, y)
-                    BmovesBoard |= movesBoard
-                    Battacks += cnt
-                elif piece != 0:
-                    if piece == Wpawn:
-                        WPawnArray |= 1 << (x + y*8)
-                        WSum += self.pawnWBL[(7-y)*8 + x] if lateGame else self.pawnWBE[(7-y)*8 + x]
-                    elif piece == Wbishop:
-                        WSum += self.bishKnighWB[(7-y)*8 + x]
-                        WbishopCount += 1
-                    elif piece == Wknight:
-                        WSum += self.bishKnighWB[(7-y)*8 + x]
-                    elif piece == Wrook and not lateGame:
+        board = self.board  # local ref avoids repeated attribute lookup
+
+        # Pre-pass: build own-piece occupancy bitboards needed for mobility computation.
+        # O(64) with minimal per-step cost; avoids per-piece rebuild inside the main loop.
+        own_W_bb = 0
+        own_B_bb = 0
+        for sq in range(64):
+            pc = board[sq]
+            if 0 < pc < pieceDivider:
+                own_W_bb |= 1 << sq
+            elif pc > pieceDivider:
+                own_B_bb |= 1 << sq
+
+        # Main pass: PST scores + mobility via precomputed tables (no _getMoves calls).
+        for sq in range(64):
+            piece = board[sq]
+            if piece == empty:
+                continue
+            x, y = sq % 8, sq // 8
+
+            if piece > pieceDivider:  # ---- black piece ----
+                BSum += self.pValues[piece]
+                if piece == Bpawn:
+                    BPawnArray |= 1 << sq
+                    BSum += self.pawnWBL[sq] if lateGame else self.pawnWBE[sq]
+                    # Push mobility
+                    if y > 0 and board[sq - 8] == empty:
+                        Battacks += 1
+                        if y == 6 and board[sq - 16] == empty:
+                            Battacks += 1
+                    # Diagonal captures via precomputed attack table
+                    atk = self._BPAWN_ATTACKS[sq]
+                    BmovesBoard |= atk
+                    Battacks += bin(atk & own_W_bb).count('1') * 2
+                    if self.enPas[0] != -1 and self.enPas[1] == y:
+                        ep_sq = (y - 1) * 8 + self.enPas[0]
+                        if atk & (1 << ep_sq):
+                            Battacks += 2
+                elif piece == Bknight:
+                    BSum += self.bishKnighWB[sq]
+                    atk = self._KNIGHT_ATTACKS[sq]
+                    BmovesBoard |= atk
+                    reachable = atk & ~own_B_bb
+                    Battacks += bin(reachable).count('1') + bin(reachable & own_W_bb).count('1')
+                elif piece == Bbishop:
+                    BSum += self.bishKnighWB[sq]
+                    BbishopCount += 1
+                    atk = cnt = 0
+                    for ray in self._BISHOP_RAYS[sq]:
+                        for idx in ray:
+                            pc2 = board[idx]
+                            if pc2 == empty:
+                                atk |= 1 << idx; cnt += 1
+                            else:
+                                if pc2 < pieceDivider:  # white piece = enemy
+                                    atk |= 1 << idx; cnt += 2
+                                break
+                    BmovesBoard |= atk; Battacks += cnt
+                elif piece == Brook:
+                    if not lateGame:
+                        BSum += self.rookWBE[sq]
+                    atk = cnt = 0
+                    for ray in self._ROOK_RAYS[sq]:
+                        for idx in ray:
+                            pc2 = board[idx]
+                            if pc2 == empty:
+                                atk |= 1 << idx; cnt += 1
+                            else:
+                                if pc2 < pieceDivider:
+                                    atk |= 1 << idx; cnt += 2
+                                break
+                    BmovesBoard |= atk; Battacks += cnt
+                elif piece == Bqueen:
+                    if not lateGame:
+                        BSum += self.queenWBE[sq]
+                    atk = cnt = 0
+                    for ray in self._QUEEN_RAYS[sq]:
+                        for idx in ray:
+                            pc2 = board[idx]
+                            if pc2 == empty:
+                                atk |= 1 << idx; cnt += 1
+                            else:
+                                if pc2 < pieceDivider:
+                                    atk |= 1 << idx; cnt += 2
+                                break
+                    BmovesBoard |= atk; Battacks += cnt
+                elif piece == Bking:
+                    BSum += self.kingWBL[sq] if lateGame else self.kingWBE[sq]
+                    BkingCoord = (x, y)
+                    atk = self._KING_ATTACKS[sq]
+                    BmovesBoard |= atk
+                    reachable = atk & ~own_B_bb
+                    Battacks += bin(reachable).count('1') + bin(reachable & own_W_bb).count('1')
+
+            else:  # ---- white piece ----
+                WSum += self.pValues[piece]
+                if piece == Wpawn:
+                    WPawnArray |= 1 << sq
+                    WSum += self.pawnWBL[(7-y)*8 + x] if lateGame else self.pawnWBE[(7-y)*8 + x]
+                    # Push mobility
+                    if y < 7 and board[sq + 8] == empty:
+                        Wattacks += 1
+                        if y == 1 and board[sq + 16] == empty:
+                            Wattacks += 1
+                    # Diagonal captures via precomputed attack table
+                    atk = self._WPAWN_ATTACKS[sq]
+                    WmovesBoard |= atk
+                    Wattacks += bin(atk & own_B_bb).count('1') * 2
+                    if self.enPas[0] != -1 and self.enPas[1] == y:
+                        ep_sq = (y + 1) * 8 + self.enPas[0]
+                        if atk & (1 << ep_sq):
+                            Wattacks += 2
+                elif piece == Wknight:
+                    WSum += self.bishKnighWB[(7-y)*8 + x]
+                    atk = self._KNIGHT_ATTACKS[sq]
+                    WmovesBoard |= atk
+                    reachable = atk & ~own_W_bb
+                    Wattacks += bin(reachable).count('1') + bin(reachable & own_B_bb).count('1')
+                elif piece == Wbishop:
+                    WSum += self.bishKnighWB[(7-y)*8 + x]
+                    WbishopCount += 1
+                    atk = cnt = 0
+                    for ray in self._BISHOP_RAYS[sq]:
+                        for idx in ray:
+                            pc2 = board[idx]
+                            if pc2 == empty:
+                                atk |= 1 << idx; cnt += 1
+                            else:
+                                if pc2 > pieceDivider:  # black piece = enemy
+                                    atk |= 1 << idx; cnt += 2
+                                break
+                    WmovesBoard |= atk; Wattacks += cnt
+                elif piece == Wrook:
+                    if not lateGame:
                         WSum += self.rookWBE[(7-y)*8 + x]
-                    elif piece == Wking:
-                        WSum += self.kingWBL[(7-y)*8 + x] if lateGame else self.kingWBE[(7-y)*8 + x]
-                        WkingCoord = [x, y]
-                    elif piece == Wqueen and not lateGame:
+                    atk = cnt = 0
+                    for ray in self._ROOK_RAYS[sq]:
+                        for idx in ray:
+                            pc2 = board[idx]
+                            if pc2 == empty:
+                                atk |= 1 << idx; cnt += 1
+                            else:
+                                if pc2 > pieceDivider:
+                                    atk |= 1 << idx; cnt += 2
+                                break
+                    WmovesBoard |= atk; Wattacks += cnt
+                elif piece == Wqueen:
+                    if not lateGame:
                         WSum += self.queenWBE[(7-y)*8 + x]
-                    WSum += self.pValues[piece]
-                    movesBoard, cnt = self._getMoves(x, y)
-                    WmovesBoard |= movesBoard
-                    Wattacks += cnt
+                    atk = cnt = 0
+                    for ray in self._QUEEN_RAYS[sq]:
+                        for idx in ray:
+                            pc2 = board[idx]
+                            if pc2 == empty:
+                                atk |= 1 << idx; cnt += 1
+                            else:
+                                if pc2 > pieceDivider:
+                                    atk |= 1 << idx; cnt += 2
+                                break
+                    WmovesBoard |= atk; Wattacks += cnt
+                elif piece == Wking:
+                    WSum += self.kingWBL[(7-y)*8 + x] if lateGame else self.kingWBE[(7-y)*8 + x]
+                    WkingCoord = (x, y)
+                    atk = self._KING_ATTACKS[sq]
+                    WmovesBoard |= atk
+                    reachable = atk & ~own_W_bb
+                    Wattacks += bin(reachable).count('1') + bin(reachable & own_B_bb).count('1')
         
         
         if not (self.rkMoved & (1 << 1)):
@@ -357,35 +533,84 @@ class chessBoard2:
     # Returns list of all possible moves a player can make
     def getLegalMoves(self) -> []:
         moves = []
-        inCheck = self._kingChecked(self.whitesMove)
-        if (self.whitesMove):
-            for t in range(8):
-                for p in range(8):
-                    if (self.board[p*8 + t] < pieceDivider) and (self.board[p*8 + t] != empty):
-                        bb, _ = self._getMoves(t, p, rokad=not inCheck)
-                        while bb:
-                            bit = bb & -bb; bb ^= bit
-                            pos = bit.bit_length() - 1
-                            x, y = pos % 8, pos // 8
-                            move = Move(t, p, x, y)
-                            if self._legalMove(move):
-                                if self.board[x + y*8] != empty:
-                                    move.setAttacking()
-                                moves.append(move)
-        else:
-            for t in range(8):
-                for p in range(8):
-                    if self.board[p*8 + t] > pieceDivider:
-                        bb, _ = self._getMoves(t, p, rokad=not inCheck)
-                        while bb:
-                            bit = bb & -bb; bb ^= bit
-                            pos = bit.bit_length() - 1
-                            x, y = pos % 8, pos // 8
-                            move = Move(t, p, x, y)
-                            if self._legalMove(move):
-                                if self.board[x + y*8] != empty:
-                                    move.setAttacking()
-                                moves.append(move)
+        board = self.board
+        white = self.whitesMove
+        in_check = self._kingChecked(white)
+
+        # Pre-compute absolutely-pinned squares via ray-tracing from the king.
+        # A piece is pinned if it is the sole friendly piece between the king and
+        # an enemy slider on that ray.  Pinned pieces and king moves still go
+        # through _legalMove(); all other non-king pieces skip it entirely.
+        pinned_set = set()
+        if not in_check:
+            kx = self.whiteKingPos[0] if white else self.blackKingPos[0]
+            ky = self.whiteKingPos[1] if white else self.blackKingPos[1]
+            rq = (Brook, Bqueen) if white else (Wrook, Wqueen)
+            bq = (Bbishop, Bqueen) if white else (Wbishop, Wqueen)
+            for (dx, dy), sliders in (((1,0), rq), ((-1,0), rq), ((0,1), rq), ((0,-1), rq),
+                                       ((1,1), bq), ((1,-1), bq), ((-1,1), bq), ((-1,-1), bq)):
+                nx, ny = kx+dx, ky+dy
+                blocker = -1
+                while 0 <= nx <= 7 and 0 <= ny <= 7:
+                    sq2 = ny*8+nx
+                    pc2 = board[sq2]
+                    if pc2 != empty:
+                        if white:
+                            if 0 < pc2 < pieceDivider:   # own piece
+                                if blocker == -1: blocker = sq2
+                                else: break              # two own pieces — no pin
+                            else:                        # enemy piece
+                                if blocker != -1 and pc2 in sliders:
+                                    pinned_set.add(blocker)
+                                break
+                        else:
+                            if pc2 > pieceDivider:       # own piece
+                                if blocker == -1: blocker = sq2
+                                else: break
+                            else:                        # enemy piece
+                                if blocker != -1 and pc2 in sliders:
+                                    pinned_set.add(blocker)
+                                break
+                    nx += dx; ny += dy
+
+        ep_x = self.enPas[0]  # -1 when no en passant is available
+
+        for sq in range(64):
+            pc = board[sq]
+            if white:
+                if pc == empty or pc >= pieceDivider: continue
+                is_king = (pc == Wking)
+                is_pawn = (pc == Wpawn)
+            else:
+                if pc <= pieceDivider: continue
+                is_king = (pc == Bking)
+                is_pawn = (pc == Bpawn)
+
+            tx, ty = sq % 8, sq // 8
+            # must_check: king moves, any move while in check, and pinned pieces.
+            # Safe pieces (not pinned, not king, not in check) cannot expose the king,
+            # so their pseudo-legal moves are all legal — skip _legalMove entirely.
+            must_check = in_check or is_king or (sq in pinned_set)
+
+            bb, _ = self._getMoves(tx, ty, rokad=not in_check)
+            while bb:
+                bit = bb & -bb; bb ^= bit
+                dest = bit.bit_length() - 1
+                dx2, dy2 = dest % 8, dest // 8
+                move = Move(tx, ty, dx2, dy2)
+
+                dest_pc = board[dest]
+                if dest_pc != empty:
+                    move.setAttacking()
+
+                # En passant: diagonal pawn move to an empty square.  Even when the
+                # pawn is not pinned, en passant can expose a rank pin (both the moving
+                # pawn and the captured pawn leave the same rank), so always check it.
+                if must_check or (is_pawn and ep_x != -1 and dest_pc == empty and dx2 != tx):
+                    if not self._legalMove(move):
+                        continue
+                moves.append(move)
+
         return moves
 
     # Set up the board to starting position
