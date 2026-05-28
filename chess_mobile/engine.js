@@ -1,0 +1,983 @@
+'use strict';
+
+// ── Imports ───────────────────────────────────────────────────────────────────
+const _utils = (typeof module !== 'undefined' && module.exports)
+    ? require('./utils.js')
+    : (typeof globalThis !== 'undefined' ? globalThis : self);
+
+const { empty, Wpawn, Wbishop, Wknight, Wrook, Wqueen, Wking, pieceDivider,
+        Bpawn, Bbishop, Bknight, Brook, Bqueen, Bking,
+        onGoing, drawRep, staleMate, blackWin, whiteWin,
+        Move, LimitedSizeDict } = _utils;
+
+// ── Precomputed attack/ray tables (built once at module load) ─────────────────
+const _AT = (() => {
+    const KN=[], KG=[], WP=[], BP=[], RK=[], BS=[], QN=[];
+    const knOff=[[-2,1],[-1,2],[1,2],[2,1],[2,-1],[1,-2],[-1,-2],[-2,-1]];
+    for (let sq=0; sq<64; sq++) {
+        const x=sq&7, y=sq>>3;
+        // Knight
+        const kn=[];
+        for (const [dx,dy] of knOff) { const nx=x+dx,ny=y+dy; if(nx>=0&&nx<=7&&ny>=0&&ny<=7) kn.push(ny*8+nx); }
+        KN.push(kn);
+        // King
+        const kg=[];
+        for (let dx=-1;dx<=1;dx++) for (let dy=-1;dy<=1;dy++) {
+            if(dx===0&&dy===0) continue;
+            const nx=x+dx,ny=y+dy; if(nx>=0&&nx<=7&&ny>=0&&ny<=7) kg.push(ny*8+nx);
+        }
+        KG.push(kg);
+        // White pawn attacks (diagonally forward = y+1)
+        const wp=[]; if(y<7){ if(x>0) wp.push((y+1)*8+x-1); if(x<7) wp.push((y+1)*8+x+1); } WP.push(wp);
+        // Black pawn attacks (diagonally forward = y-1)
+        const bp=[]; if(y>0){ if(x>0) bp.push((y-1)*8+x-1); if(x<7) bp.push((y-1)*8+x+1); } BP.push(bp);
+        // Rook rays
+        const rk=[];
+        for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+            const ray=[]; let nx=x+dx,ny=y+dy;
+            while(nx>=0&&nx<=7&&ny>=0&&ny<=7){ray.push(ny*8+nx);nx+=dx;ny+=dy;}
+            if(ray.length) rk.push(ray);
+        }
+        RK.push(rk);
+        // Bishop rays
+        const bs=[];
+        for (const [dx,dy] of [[1,1],[1,-1],[-1,1],[-1,-1]]) {
+            const ray=[]; let nx=x+dx,ny=y+dy;
+            while(nx>=0&&nx<=7&&ny>=0&&ny<=7){ray.push(ny*8+nx);nx+=dx;ny+=dy;}
+            if(ray.length) bs.push(ray);
+        }
+        BS.push(bs);
+        QN.push([...rk,...bs]);
+    }
+    return {KN,KG,WP,BP,RK,BS,QN};
+})();
+
+// ── Piece-square tables (index layout: row 0 = y=0 = white's back rank) ───────
+// White pieces look up pst[(7-y)*8 + x] so their back rank maps to high indices.
+// Black pieces look up pst[sq] directly (their back rank is already at high y).
+const _PST = {
+    kingWBE: [
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+         10, 10, 10,-10,-10, 10, 10, 10,
+         20, 30, 20, 10, 10, 20, 30, 20,
+    ],
+    kingWBL: [
+          0,  0,  0,  0,  0,  0,  0,  0,
+         50, 50, 50, 50, 50, 50, 50, 50,
+         40, 40, 40, 40, 40, 40, 40, 40,
+         30, 30, 30, 30, 30, 30, 30, 30,
+         20, 20, 20, 20, 20, 20, 20, 20,
+         10, 10, 10, 10, 10, 10, 10, 10,
+          0,  0,  0,  0,  0,  0,  0,  0,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+    ],
+    // queenWBE already multiplied by 10 (matching Python: queenWBE = [item*10 ...])
+    queenWBE: [
+        -100,-100,-100,-100,-100,-100,-100,-100,
+        -100,-100,-100,-100,-100,-100,-100,-100,
+        -100,-100,-100,-100,-100,-100,-100,-100,
+        -100,-100,-100,-100,-100,-100,-100,-100,
+        -100,-100,-100,-100,-100,-100,-100,-100,
+        -100,-100,-100,-100,-100,-100,-100,-100,
+           0,  0,  0,  0,  0,  0,  0,  0,
+           0,  0,  0,  0,  0,  0,  0,  0,
+    ],
+    rookWBE: [
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+        -10,-10,-10,-10,-10,-10,-10,-10,
+          0,  0, 10, 10, 10, 10,  0,  0,
+         10, 10, 20, 20, 20, 20, 10, 10,
+    ],
+    bishKnighWB: [
+          0,  0,  0,  0,  0,  0,  0,  0,
+          0,  0,  0,  0,  0,  0,  0,  0,
+          0, 20, 20, 20, 20, 20, 20,  0,
+          0, 20, 20, 20, 20, 20, 20,  0,
+          0, 20, 20, 20, 20, 20, 20,  0,
+          0, 20, 20, 20, 20, 20, 20,  0,
+          0, 10, 10, 10, 10, 10, 10,  0,
+          0, 10, 10, 10, 10, 10, 10,  0,
+    ],
+    pawnWBE: [
+          0,  0,  0,  0,  0,  0,  0,  0,
+          0,  0,  0,  0,  0,  0,  0,  0,
+          0,  0,  0,  0,  0,  0,  0,  0,
+          0,  0,  0, 10, 10,  0,  0,  0,
+          0,  0,  0, 20, 20,  0,  0,  0,
+         20,  0, 10, 20, 20, 10,  0, 20,
+         20, 20, 20,  0,  0, 20, 20, 20,
+          0,  0,  0,  0,  0,  0,  0,  0,
+    ],
+    pawnWBL: [
+          0,  0,  0,  0,  0,  0,  0,  0,
+         50, 50, 50, 50, 50, 50, 50, 50,
+         40, 40, 40, 40, 40, 40, 40, 40,
+         30, 30, 30, 30, 30, 30, 30, 30,
+         20, 20, 20, 20, 20, 20, 20, 20,
+         10, 10, 10, 10, 10, 10, 10, 10,
+          0,  0,  0,  0,  0,  0,  0,  0,
+          0,  0,  0,  0,  0,  0,  0,  0,
+    ],
+};
+
+const _PASSED_BONUS   = [0, 0, 0, 10, 20, 35, 60, 100];
+// piece-value array indexed by piece ID 0-13 (same as Python pValues)
+const _PVALUES        = [0,100,300,300,500,900,0,  0,100,300,300,500,900,0];
+// MVV-LVA array: king gets 20000 so it's always "most valuable"
+const _MVV_LVA_VALUES = [0,100,300,300,500,900,20000,0,100,300,300,500,900,20000];
+
+// ── UndoRecord ────────────────────────────────────────────────────────────────
+class UndoRecord {
+    constructor(whitesMove, rkMoved, enPas, nonPawnCount) {
+        this.changes     = [];           // [{idx, val}, ...]
+        this.whitesMove  = whitesMove;
+        this.rkMoved     = rkMoved;
+        this.enPas       = enPas.slice();
+        this.nonPawnCount = nonPawnCount;
+    }
+}
+
+// ── ChessEngine ───────────────────────────────────────────────────────────────
+class ChessEngine {
+    constructor() {
+        this.board             = new Array(64).fill(empty);
+        this.whitesMove        = true;
+        // rkMoved bit layout: 0=Bleft 1=Bking 2=Bright 3=Wleft 4=Wking 5=Wright
+        this.rkMoved           = 0;
+        this.enPas             = [-1, -1];
+        this.whiteKingPos      = [4, 0];
+        this.blackKingPos      = [4, 7];
+        this.nonPawnCount      = 0;
+        this.boardHistory      = [];
+        this.boardHistoryCounts = {};
+        // Search stats
+        this.i                 = 0;
+        this.prunings          = 0;
+        this.lookUps           = 0;
+        this.depth             = 0;
+        this.evaluation        = 0;
+        this.avgMoveTime       = 0;
+        this._stop_search      = false;
+        this._ttable           = new LimitedSizeDict(100_000);
+        this._history          = new Int32Array(64 * 64);
+        this._killers          = Array.from({length: 128}, () => [null, null]);
+    }
+
+    // ── Public interface ──────────────────────────────────────────────────────
+
+    setupPieces() {
+        this.board = [
+            Wrook, Wknight, Wbishop, Wqueen, Wking, Wbishop, Wknight, Wrook,
+            Wpawn, Wpawn,   Wpawn,   Wpawn,  Wpawn, Wpawn,   Wpawn,   Wpawn,
+            0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,
+            0,0,0,0,0,0,0,0,  0,0,0,0,0,0,0,0,
+            Bpawn, Bpawn,   Bpawn,   Bpawn,  Bpawn, Bpawn,   Bpawn,   Bpawn,
+            Brook, Bknight, Bbishop, Bqueen, Bking, Bbishop, Bknight, Brook,
+        ];
+        this.whitesMove  = true;
+        this.rkMoved     = 0;
+        this.enPas       = [-1, -1];
+        this.whiteKingPos = [4, 0];
+        this.blackKingPos = [4, 7];
+        this.boardHistory = [];
+        this.boardHistoryCounts = {};
+        this.nonPawnCount = 0;
+        for (const p of this.board)
+            if (p !== empty && p !== Wpawn && p !== Bpawn) this.nonPawnCount++;
+    }
+
+    getPosition() { return this.board.slice(); }
+
+    // Execute a move. frfr=true: also check for game-over conditions.
+    makeMove(move, frfr = false) {
+        this._movePieces(move);
+
+        const piece = this.board[move.getX2() + move.getY2() * 8];
+
+        // En passant opportunity: pawn moved two squares
+        if ((piece === Wpawn || piece === Bpawn) &&
+                Math.abs(move.getY1() - move.getY2()) === 2) {
+            this.enPas = [move.getX2(), move.getY2()];
+        } else {
+            this.enPas = [-1, -1];
+        }
+
+        // Castling rights update based on what moved
+        if      (piece === Brook)  { this.rkMoved |= (move.getX1() === 0) ? 1 : 4; }
+        else if (piece === Wrook)  { this.rkMoved |= (move.getX1() === 0) ? 8 : 32; }
+        else if (piece === Wking)  { this.rkMoved |= 16; }
+        else if (piece === Bking)  { this.rkMoved |= 2; }
+
+        this.whitesMove = !this.whitesMove;
+
+        const bh = this._toString();
+        this.boardHistory.push(bh);
+        this.boardHistoryCounts[bh] = (this.boardHistoryCounts[bh] || 0) + 1;
+
+        if (frfr) {
+            if (this.boardHistoryCounts[bh] > 2) return drawRep;
+            const moves = this.getLegalMoves();
+            if (moves.length === 0) {
+                if (!this._kingChecked(this.whitesMove)) return staleMate;
+                return this.whitesMove ? blackWin : whiteWin;
+            }
+        }
+        return onGoing;
+    }
+
+    // ── Move generation ───────────────────────────────────────────────────────
+
+    // Returns array of legal Move objects for the side to move.
+    getLegalMoves() {
+        const moves  = [];
+        const board  = this.board;
+        const white  = this.whitesMove;
+        const inCheck = this._kingChecked(white);
+
+        // Pre-compute pinned squares by ray-tracing from king
+        const pinnedSet = new Set();
+        if (!inCheck) {
+            const [kx, ky] = white ? this.whiteKingPos : this.blackKingPos;
+            const rq = white ? [Brook, Bqueen]   : [Wrook, Wqueen];
+            const bq = white ? [Bbishop, Bqueen] : [Wbishop, Wqueen];
+            const dirs = [
+                [[1,0],rq],[[-1,0],rq],[[0,1],rq],[[0,-1],rq],
+                [[1,1],bq],[[ 1,-1],bq],[[-1,1],bq],[[-1,-1],bq],
+            ];
+            for (const [[dx,dy], sliders] of dirs) {
+                let nx=kx+dx, ny=ky+dy, blocker=-1;
+                while (nx>=0&&nx<=7&&ny>=0&&ny<=7) {
+                    const sq2=ny*8+nx, pc2=board[sq2];
+                    if (pc2 !== empty) {
+                        const isOwn = white ? (pc2>0 && pc2<pieceDivider) : (pc2>pieceDivider);
+                        if (isOwn) {
+                            if (blocker === -1) blocker = sq2;
+                            else break;
+                        } else {
+                            if (blocker !== -1 && sliders.includes(pc2)) pinnedSet.add(blocker);
+                            break;
+                        }
+                    }
+                    nx+=dx; ny+=dy;
+                }
+            }
+        }
+
+        const epX = this.enPas[0];
+
+        for (let sq=0; sq<64; sq++) {
+            const pc = board[sq];
+            if (white) { if (pc===empty || pc>=pieceDivider) continue; }
+            else       { if (pc<=pieceDivider) continue; }
+
+            const tx=sq&7, ty=sq>>3;
+            const isKing = white ? (pc===Wking) : (pc===Bking);
+            const isPawn = white ? (pc===Wpawn) : (pc===Bpawn);
+            const mustCheck = inCheck || isKing || pinnedSet.has(sq);
+
+            const dests = this._getMoves(tx, ty, !inCheck);
+            for (const dest of dests) {
+                const dx2=dest&7, dy2=dest>>3;
+                const move = new Move(tx, ty, dx2, dy2);
+                const destPc = board[dest];
+                const isEp = isPawn && epX !== -1 && destPc === empty && dx2 !== tx;
+                if (destPc !== empty || isEp) move.setAttacking();
+                if (mustCheck || isEp) {
+                    if (!this._legalMove(move)) continue;
+                }
+                moves.push(move);
+            }
+        }
+        return moves;
+    }
+
+    // Returns destination square indices (not a bitboard) for piece at (x,y).
+    _getMoves(x, y, rokad = false) {
+        const board  = this.board;
+        const piece  = board[y*8+x];
+        const dests  = [];
+
+        if (piece === Wpawn) {
+            if (y < 7) {
+                if (board[(y+1)*8+x] === empty) {
+                    dests.push((y+1)*8+x);
+                    if (y===1 && board[(y+2)*8+x]===empty) dests.push((y+2)*8+x);
+                }
+                if (x>0 && (board[(y+1)*8+x-1]>pieceDivider || (this.enPas[0]===x-1 && this.enPas[1]===y)))
+                    dests.push((y+1)*8+x-1);
+                if (x<7 && (board[(y+1)*8+x+1]>pieceDivider || (this.enPas[0]===x+1 && this.enPas[1]===y)))
+                    dests.push((y+1)*8+x+1);
+            }
+        } else if (piece === Bpawn) {
+            if (y > 0) {
+                if (board[(y-1)*8+x] === empty) {
+                    dests.push((y-1)*8+x);
+                    if (y===6 && board[(y-2)*8+x]===empty) dests.push((y-2)*8+x);
+                }
+                if (x>0 && ((board[(y-1)*8+x-1]<pieceDivider && board[(y-1)*8+x-1]!==empty) || (this.enPas[0]===x-1 && this.enPas[1]===y)))
+                    dests.push((y-1)*8+x-1);
+                if (x<7 && ((board[(y-1)*8+x+1]<pieceDivider && board[(y-1)*8+x+1]!==empty) || (this.enPas[0]===x+1 && this.enPas[1]===y)))
+                    dests.push((y-1)*8+x+1);
+            }
+        } else if (piece === Wrook || piece === Brook) {
+            const mine = (piece === Wrook);
+            for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+                let t=x+dx, p=y+dy;
+                while (t>=0&&t<=7&&p>=0&&p<=7) {
+                    const pc2=board[p*8+t];
+                    if (pc2===empty) { dests.push(p*8+t); t+=dx; p+=dy; }
+                    else { if (mine ? pc2>pieceDivider : pc2<pieceDivider) dests.push(p*8+t); break; }
+                }
+            }
+        } else if (piece === Wbishop || piece === Bbishop) {
+            const mine = (piece === Wbishop);
+            for (const [dx,dy] of [[1,1],[1,-1],[-1,1],[-1,-1]]) {
+                let t=x+dx, p=y+dy;
+                while (t>=0&&t<=7&&p>=0&&p<=7) {
+                    const pc2=board[p*8+t];
+                    if (pc2===empty) { dests.push(p*8+t); t+=dx; p+=dy; }
+                    else { if (mine ? pc2>pieceDivider : pc2<pieceDivider) dests.push(p*8+t); break; }
+                }
+            }
+        } else if (piece === Wqueen || piece === Bqueen) {
+            const mine = (piece === Wqueen);
+            for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]]) {
+                let t=x+dx, p=y+dy;
+                while (t>=0&&t<=7&&p>=0&&p<=7) {
+                    const pc2=board[p*8+t];
+                    if (pc2===empty) { dests.push(p*8+t); t+=dx; p+=dy; }
+                    else { if (mine ? pc2>pieceDivider : pc2<pieceDivider) dests.push(p*8+t); break; }
+                }
+            }
+        } else if (piece === Wking) {
+            for (let t=x-1;t<=x+1;t++) for (let p=y-1;p<=y+1;p++) {
+                if (t<0||t>7||p<0||p>7||(t===x&&p===y)) continue;
+                if (board[p*8+t]===empty || board[p*8+t]>pieceDivider) dests.push(p*8+t);
+            }
+            if (rokad && !(this.rkMoved & 16)) {
+                if (!(this.rkMoved & 8)  && board[1]===empty && board[2]===empty && board[3]===empty) dests.push(2);
+                if (!(this.rkMoved & 32) && board[5]===empty && board[6]===empty) dests.push(6);
+            }
+        } else if (piece === Bking) {
+            for (let t=x-1;t<=x+1;t++) for (let p=y-1;p<=y+1;p++) {
+                if (t<0||t>7||p<0||p>7||(t===x&&p===y)) continue;
+                if (board[p*8+t]===empty || board[p*8+t]<pieceDivider) dests.push(p*8+t);
+            }
+            if (rokad && !(this.rkMoved & 2)) {
+                if (!(this.rkMoved & 1)  && board[57]===empty && board[58]===empty && board[59]===empty) dests.push(58);
+                if (!(this.rkMoved & 4)  && board[61]===empty && board[62]===empty) dests.push(62);
+            }
+        } else if (piece === Wknight || piece === Bknight) {
+            const mine = (piece === Wknight);
+            for (const [dx,dy] of [[-2,1],[-1,2],[1,2],[2,1],[2,-1],[1,-2],[-1,-2],[-2,-1]]) {
+                const t=x+dx, p=y+dy;
+                if (t<0||t>7||p<0||p>7) continue;
+                const pc2=board[p*8+t];
+                if (pc2===empty || (mine ? pc2>pieceDivider : pc2<pieceDivider)) dests.push(p*8+t);
+            }
+        }
+        return dests;
+    }
+
+    // Ray-trace check detection from king position (~4x faster than generating all moves)
+    _kingChecked(checkWhiteKing) {
+        const [kx,ky] = checkWhiteKing ? this.whiteKingPos : this.blackKingPos;
+        const board = this.board;
+        const e_rq     = checkWhiteKing ? [Brook,  Bqueen]  : [Wrook,  Wqueen];
+        const e_bq     = checkWhiteKing ? [Bbishop,Bqueen]  : [Wbishop,Wqueen];
+        const e_knight = checkWhiteKing ? Bknight : Wknight;
+        const e_pawn   = checkWhiteKing ? Bpawn   : Wpawn;
+        const e_king   = checkWhiteKing ? Bking   : Wking;
+        const pawn_dy  = checkWhiteKing ? 1 : -1;  // direction enemy pawns come from
+
+        // Rook/queen — horizontal and vertical rays
+        for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+            let x=kx+dx, y=ky+dy;
+            while (x>=0&&x<=7&&y>=0&&y<=7) {
+                const p=board[y*8+x];
+                if (p!==empty) { if(p===e_rq[0]||p===e_rq[1]) return true; break; }
+                x+=dx; y+=dy;
+            }
+        }
+        // Bishop/queen — diagonal rays
+        for (const [dx,dy] of [[1,1],[1,-1],[-1,1],[-1,-1]]) {
+            let x=kx+dx, y=ky+dy;
+            while (x>=0&&x<=7&&y>=0&&y<=7) {
+                const p=board[y*8+x];
+                if (p!==empty) { if(p===e_bq[0]||p===e_bq[1]) return true; break; }
+                x+=dx; y+=dy;
+            }
+        }
+        // Knights
+        for (const [dx,dy] of [[-2,1],[-1,2],[1,2],[2,1],[2,-1],[1,-2],[-1,-2],[-2,-1]]) {
+            const x=kx+dx, y=ky+dy;
+            if (x>=0&&x<=7&&y>=0&&y<=7&&board[y*8+x]===e_knight) return true;
+        }
+        // Pawns (sit one rank in pawn_dy direction on adjacent files)
+        const py=ky+pawn_dy;
+        if (py>=0&&py<=7) {
+            if (kx>0 && board[py*8+kx-1]===e_pawn) return true;
+            if (kx<7 && board[py*8+kx+1]===e_pawn) return true;
+        }
+        // Enemy king
+        for (let dx=-1;dx<=1;dx++) for (let dy=-1;dy<=1;dy++) {
+            if (dx===0&&dy===0) continue;
+            const x=kx+dx, y=ky+dy;
+            if (x>=0&&x<=7&&y>=0&&y<=7&&board[y*8+x]===e_king) return true;
+        }
+        return false;
+    }
+
+    // Returns true if the move is legal (own king not in check after the move)
+    _legalMove(move) {
+        const rec = this._saveState(move);
+        this._movePieces(move);
+        const legal = !this._kingChecked(this.whitesMove);
+        // Partial undo (only board + king positions; whitesMove etc. unchanged)
+        for (const [idx, val] of rec.changes) {
+            this.board[idx] = val;
+            if (val === Wking) this.whiteKingPos = [idx&7, idx>>3];
+            else if (val === Bking) this.blackKingPos = [idx&7, idx>>3];
+        }
+        return legal;
+    }
+
+    // ── State management ──────────────────────────────────────────────────────
+
+    // Capture board squares that will change for this move (call before _movePieces)
+    _saveState(move) {
+        const rec = new UndoRecord(this.whitesMove, this.rkMoved, this.enPas, this.nonPawnCount);
+        const x1=move.getX1(), y1=move.getY1(), x2=move.getX2(), y2=move.getY2();
+        const piece = this.board[x1+y1*8];
+        rec.changes.push([x1+y1*8, piece]);
+        rec.changes.push([x2+y2*8, this.board[x2+y2*8]]);
+        // Castling: rook squares that _movePieces will touch
+        if (piece===Wking && !(this.rkMoved & 16)) {
+            if      (x2===2) rec.changes.push([0,this.board[0]], [3,this.board[3]]);
+            else if (x2===6) rec.changes.push([7,this.board[7]], [5,this.board[5]]);
+        } else if (piece===Bking && !(this.rkMoved & 2)) {
+            if      (x2===2) rec.changes.push([56,this.board[56]], [59,this.board[59]]);
+            else if (x2===6) rec.changes.push([63,this.board[63]], [61,this.board[61]]);
+        }
+        // En passant: captured pawn square
+        if (this.enPas[0]===x2) {
+            if ((piece===Bpawn && y2===this.enPas[1]-1) ||
+                (piece===Wpawn && y2===this.enPas[1]+1))
+                rec.changes.push([x2+this.enPas[1]*8, this.board[x2+this.enPas[1]*8]]);
+        }
+        return rec;
+    }
+
+    // Move pieces on the board (does NOT update en passant / rkMoved / turn)
+    _movePieces(move) {
+        const board = this.board;
+        const x1=move.getX1(), y1=move.getY1(), x2=move.getX2(), y2=move.getY2();
+        const piece    = board[x1+y1*8];
+        const captured = board[x2+y2*8];
+
+        board[x2+y2*8] = piece;
+        board[x1+y1*8] = empty;
+
+        if (captured!==empty && captured!==Wpawn && captured!==Bpawn) this.nonPawnCount--;
+
+        if      (piece===Wking) { this.whiteKingPos=[x2,y2]; }
+        else if (piece===Bking) { this.blackKingPos=[x2,y2]; }
+
+        // Castling: move rook
+        if (piece===Wking && !(this.rkMoved & 16)) {
+            if      (x2===2 && board[0]===Wrook) { board[0]=empty; board[3]=Wrook; }
+            else if (x2===6 && board[7]===Wrook) { board[7]=empty; board[5]=Wrook; }
+        } else if (piece===Bking && !(this.rkMoved & 2)) {
+            if      (x2===2 && board[56]===Brook) { board[56]=empty; board[59]=Brook; }
+            else if (x2===6 && board[63]===Brook) { board[63]=empty; board[61]=Brook; }
+        }
+
+        // En passant capture
+        if (this.enPas[0]===x2) {
+            if (piece===Bpawn && y2===this.enPas[1]-1) board[x2+this.enPas[1]*8]=empty;
+            else if (piece===Wpawn && y2===this.enPas[1]+1) board[x2+this.enPas[1]*8]=empty;
+        }
+
+        // Promotion (always to queen)
+        if (piece===Wpawn && y2===7) { board[x2+56]=Wqueen; this.nonPawnCount++; }
+        else if (piece===Bpawn && y2===0) { board[x2]=Bqueen; this.nonPawnCount++; }
+    }
+
+    _undoMove(rec) {
+        for (const [idx, val] of rec.changes) {
+            this.board[idx] = val;
+            if      (val===Wking) this.whiteKingPos=[idx&7,idx>>3];
+            else if (val===Bking) this.blackKingPos=[idx&7,idx>>3];
+        }
+        this.whitesMove   = rec.whitesMove;
+        this.rkMoved      = rec.rkMoved;
+        this.enPas        = rec.enPas;
+        this.nonPawnCount = rec.nonPawnCount;
+        const bh = this.boardHistory.pop();
+        const cnt = (this.boardHistoryCounts[bh] || 0) - 1;
+        if (cnt <= 0) delete this.boardHistoryCounts[bh];
+        else this.boardHistoryCounts[bh] = cnt;
+    }
+
+    _toString() { return this.board.join(','); }
+
+    // ── Position evaluation ───────────────────────────────────────────────────
+
+    evaluatePosition() {
+        const board = this.board;
+        let WSum=0, BSum=0, Wattacks=0, Battacks=0;
+        let WkingSq=-1, BkingSq=-1;
+        const wPawns=[], bPawns=[];
+        let WbishopCount=0, BbishopCount=0;
+        let wAtkKing=false, bAtkKing=false;
+
+        let nonEmpty=0;
+        for (let i=0;i<64;i++) if(board[i]!==empty) nonEmpty++;
+        const lateGame = nonEmpty < 15;
+
+        for (let sq=0; sq<64; sq++) {
+            const piece=board[sq]; if(piece===empty) continue;
+            const x=sq&7, y=sq>>3;
+
+            if (piece > pieceDivider) {
+                // ── Black piece ──
+                BSum += _PVALUES[piece];
+                if (piece===Bpawn) {
+                    bPawns.push(sq);
+                    BSum += lateGame ? _PST.pawnWBL[sq] : _PST.pawnWBE[sq];
+                    if (y>0 && board[sq-8]===empty) { Battacks++; if(y===6&&board[sq-16]===empty) Battacks++; }
+                    for (const atkSq of _AT.BP[sq]) {
+                        if (atkSq===WkingSq) bAtkKing=true;
+                        if (board[atkSq]>0 && board[atkSq]<pieceDivider) Battacks+=2;
+                    }
+                    if (this.enPas[0]!==-1 && this.enPas[1]===y) {
+                        for (const atkSq of _AT.BP[sq])
+                            if (atkSq===((y-1)*8+this.enPas[0])) Battacks+=2;
+                    }
+                } else if (piece===Bknight) {
+                    BSum += _PST.bishKnighWB[sq];
+                    for (const atkSq of _AT.KN[sq]) {
+                        if (atkSq===WkingSq) bAtkKing=true;
+                        const pc2=board[atkSq];
+                        if (pc2===empty||pc2<pieceDivider) { Battacks++; if(pc2>0&&pc2<pieceDivider) Battacks++; }
+                    }
+                } else if (piece===Bbishop) {
+                    BSum += _PST.bishKnighWB[sq]; BbishopCount++;
+                    for (const ray of _AT.BS[sq]) for (const idx of ray) {
+                        const pc2=board[idx];
+                        if (pc2===empty) { Battacks++; }
+                        else { if(pc2<pieceDivider){Battacks+=2;if(idx===WkingSq)bAtkKing=true;} break; }
+                    }
+                } else if (piece===Brook) {
+                    if (!lateGame) BSum += _PST.rookWBE[sq];
+                    for (const ray of _AT.RK[sq]) for (const idx of ray) {
+                        const pc2=board[idx];
+                        if (pc2===empty) { Battacks++; }
+                        else { if(pc2<pieceDivider){Battacks+=2;if(idx===WkingSq)bAtkKing=true;} break; }
+                    }
+                } else if (piece===Bqueen) {
+                    if (!lateGame) BSum += _PST.queenWBE[sq];
+                    for (const ray of _AT.QN[sq]) for (const idx of ray) {
+                        const pc2=board[idx];
+                        if (pc2===empty) { Battacks++; }
+                        else { if(pc2<pieceDivider){Battacks+=2;if(idx===WkingSq)bAtkKing=true;} break; }
+                    }
+                } else if (piece===Bking) {
+                    BkingSq=sq;
+                    BSum += lateGame ? _PST.kingWBL[sq] : _PST.kingWBE[sq];
+                    for (const atkSq of _AT.KG[sq]) {
+                        if (atkSq===WkingSq) bAtkKing=true;
+                        const pc2=board[atkSq];
+                        if (pc2===empty||pc2<pieceDivider) { Battacks++; if(pc2>0&&pc2<pieceDivider) Battacks++; }
+                    }
+                }
+            } else {
+                // ── White piece ──
+                WSum += _PVALUES[piece];
+                const wi = (7-y)*8+x;   // PST index for white (flipped y)
+                if (piece===Wpawn) {
+                    wPawns.push(sq);
+                    WSum += lateGame ? _PST.pawnWBL[wi] : _PST.pawnWBE[wi];
+                    if (y<7 && board[sq+8]===empty) { Wattacks++; if(y===1&&board[sq+16]===empty) Wattacks++; }
+                    for (const atkSq of _AT.WP[sq]) {
+                        if (atkSq===BkingSq) wAtkKing=true;
+                        if (board[atkSq]>pieceDivider) Wattacks+=2;
+                    }
+                    if (this.enPas[0]!==-1 && this.enPas[1]===y) {
+                        for (const atkSq of _AT.WP[sq])
+                            if (atkSq===((y+1)*8+this.enPas[0])) Wattacks+=2;
+                    }
+                } else if (piece===Wknight) {
+                    WSum += _PST.bishKnighWB[wi];
+                    for (const atkSq of _AT.KN[sq]) {
+                        if (atkSq===BkingSq) wAtkKing=true;
+                        const pc2=board[atkSq];
+                        if (pc2===empty||pc2>pieceDivider) { Wattacks++; if(pc2>pieceDivider) Wattacks++; }
+                    }
+                } else if (piece===Wbishop) {
+                    WSum += _PST.bishKnighWB[wi]; WbishopCount++;
+                    for (const ray of _AT.BS[sq]) for (const idx of ray) {
+                        const pc2=board[idx];
+                        if (pc2===empty) { Wattacks++; }
+                        else { if(pc2>pieceDivider){Wattacks+=2;if(idx===BkingSq)wAtkKing=true;} break; }
+                    }
+                } else if (piece===Wrook) {
+                    if (!lateGame) WSum += _PST.rookWBE[wi];
+                    for (const ray of _AT.RK[sq]) for (const idx of ray) {
+                        const pc2=board[idx];
+                        if (pc2===empty) { Wattacks++; }
+                        else { if(pc2>pieceDivider){Wattacks+=2;if(idx===BkingSq)wAtkKing=true;} break; }
+                    }
+                } else if (piece===Wqueen) {
+                    if (!lateGame) WSum += _PST.queenWBE[wi];
+                    for (const ray of _AT.QN[sq]) for (const idx of ray) {
+                        const pc2=board[idx];
+                        if (pc2===empty) { Wattacks++; }
+                        else { if(pc2>pieceDivider){Wattacks+=2;if(idx===BkingSq)wAtkKing=true;} break; }
+                    }
+                } else if (piece===Wking) {
+                    WkingSq=sq;
+                    WSum += lateGame ? _PST.kingWBL[wi] : _PST.kingWBE[wi];
+                    for (const atkSq of _AT.KG[sq]) {
+                        if (atkSq===BkingSq) wAtkKing=true;
+                        const pc2=board[atkSq];
+                        if (pc2===empty||pc2>pieceDivider) { Wattacks++; if(pc2>pieceDivider) Wattacks++; }
+                    }
+                }
+            }
+        }
+
+        // Castling rights bonus
+        if (!(this.rkMoved & 2)) {
+            let cnt=0;
+            if (!(this.rkMoved & 1)) cnt++;
+            if (!(this.rkMoved & 4)) cnt++;
+            BSum += cnt * 100;
+        }
+        if (!(this.rkMoved & 16)) {
+            let cnt=0;
+            if (!(this.rkMoved & 8))  cnt++;
+            if (!(this.rkMoved & 32)) cnt++;
+            WSum += cnt * 100;
+        }
+
+        WSum += Wattacks * 10;
+        BSum += Battacks * 10;
+
+        // Pawn structure — precompute file/square sets
+        const wPawnFiles = new Set(wPawns.map(s => s & 7));
+        const bPawnFiles = new Set(bPawns.map(s => s & 7));
+        const wPawnSet   = new Set(wPawns);
+        const bPawnSet   = new Set(bPawns);
+
+        // Doubled pawns
+        for (let x=0;x<8;x++) {
+            const wC = wPawns.filter(s=>(s&7)===x).length;
+            const bC = bPawns.filter(s=>(s&7)===x).length;
+            if (wC>1) WSum += wC * (-50);
+            if (bC>1) BSum += bC * (-50);
+        }
+
+        // Per-file: isolated pawn, rook open file, passed pawn
+        for (let x=0;x<8;x++) {
+            const wHas = wPawnFiles.has(x);
+            const bHas = bPawnFiles.has(x);
+            if (wHas && !wPawnFiles.has(x-1) && !wPawnFiles.has(x+1)) WSum -= 20;
+            if (bHas && !bPawnFiles.has(x-1) && !bPawnFiles.has(x+1)) BSum -= 20;
+
+            for (let y=0;y<8;y++) {
+                const pc = board[y*8+x];
+                if (pc===Wrook) {
+                    if (!wHas && !bHas) WSum+=50; else if (!wHas) WSum+=25;
+                    if (y===6) WSum+=25;
+                } else if (pc===Brook) {
+                    if (!wHas && !bHas) BSum+=50; else if (!bHas) BSum+=25;
+                    if (y===1) BSum+=25;
+                }
+            }
+
+            // Passed pawns
+            for (let y=2;y<=6;y++) {
+                const sq=x+y*8;
+                if (wPawnSet.has(sq)) {
+                    const passed = !bPawns.some(s => { const bx=s&7,by=s>>3; return Math.abs(bx-x)<=1 && by>y; });
+                    if (passed) WSum += _PASSED_BONUS[y];
+                }
+                if (bPawnSet.has(sq)) {
+                    const passed = !wPawns.some(s => { const wx=s&7,wy=s>>3; return Math.abs(wx-x)<=1 && wy<y; });
+                    if (passed) BSum += _PASSED_BONUS[7-y];
+                }
+            }
+        }
+
+        // Bishop pair bonus
+        if (WbishopCount >= 2) WSum += 30;
+        if (BbishopCount >= 2) BSum += 30;
+
+        // King safety pawn shield (middlegame only)
+        if (!lateGame && WkingSq !== -1 && BkingSq !== -1) {
+            const wx=WkingSq&7, wy=WkingSq>>3;
+            const bx=BkingSq&7, by=BkingSq>>3;
+            for (let dx=-1;dx<=1;dx++) {
+                let sx=wx+dx;
+                if (sx>=0&&sx<8) {
+                    if (wy+1<8 && wPawnSet.has(sx+(wy+1)*8))       WSum+=15;
+                    else if (wy+2<8 && wPawnSet.has(sx+(wy+2)*8))  WSum+=7;
+                }
+                sx=bx+dx;
+                if (sx>=0&&sx<8) {
+                    if (by-1>=0 && bPawnSet.has(sx+(by-1)*8))      BSum+=15;
+                    else if (by-2>=0 && bPawnSet.has(sx+(by-2)*8)) BSum+=7;
+                }
+            }
+        }
+
+        // Check bonus
+        if (wAtkKing) WSum += 50;
+        if (bAtkKing) BSum += 50;
+
+        let evaluation = WSum - BSum;
+        // Tempo bonus
+        evaluation += this.whitesMove ? 17 : -17;
+        return evaluation;
+    }
+
+    // ── Move ordering ─────────────────────────────────────────────────────────
+
+    _mvvLvaScore(move, depth = 0, ttMove = null) {
+        if (ttMove !== null && move.equals(ttMove)) return 2_000_000;
+        if (move.getAttacking() === 1) {
+            const victim   = this.board[move.getX2() + move.getY2()*8];
+            const attacker = this.board[move.getX1() + move.getY1()*8];
+            const victimVal = victim !== empty ? _MVV_LVA_VALUES[victim] : _MVV_LVA_VALUES[Wpawn];
+            return 1_000_000 + 10 * victimVal - _MVV_LVA_VALUES[attacker];
+        }
+        if (this._killers[depth][0] !== null && move.equals(this._killers[depth][0])) return 900_000;
+        if (this._killers[depth][1] !== null && move.equals(this._killers[depth][1])) return 800_000;
+        return this._history[move.getX1()*8 + move.getY1() + (move.getX2()*8 + move.getY2()) * 64] || 0;
+        // Note: history key = from*64 + to (both as linear sq index)
+    }
+
+    _sortMoves(moves, depth = 0, ttMove = null) {
+        moves.sort((a, b) => this._mvvLvaScore(b, depth, ttMove) - this._mvvLvaScore(a, depth, ttMove));
+        return moves;
+    }
+
+    // ── Search ────────────────────────────────────────────────────────────────
+
+    // Quiescence search: stand-pat + recursive capture search.
+    _quiesce(alpha, beta, timeLimitMs, startTime) {
+        if (this._stop_search) return -Infinity;
+        if ((Date.now() - startTime) > timeLimitMs) { this._stop_search=true; return -Infinity; }
+
+        const standPat = this.whitesMove ? this.evaluatePosition() : -this.evaluatePosition();
+        this.i++;
+        if (standPat >= beta) return standPat;
+        if (standPat > alpha) alpha = standPat;
+
+        const moves = this.getLegalMoves();
+        const captures = moves.filter(m => m.getAttacking()===1 && (() => {
+            const vv = _PVALUES[this.board[m.getX2()+m.getY2()*8]];
+            const av = _PVALUES[this.board[m.getX1()+m.getY1()*8]];
+            return vv===0 || vv*3 >= av;
+        })());
+        captures.sort((a,b) => this._mvvLvaScore(b) - this._mvvLvaScore(a));
+
+        let best = standPat;
+        for (const move of captures) {
+            const rec = this._saveState(move);
+            this.makeMove(move);
+            const score = -this._quiesce(-beta, -alpha, timeLimitMs, startTime);
+            this._undoMove(rec);
+            if (this._stop_search) break;
+            if (score > best) best = score;
+            if (score > alpha) alpha = score;
+            if (alpha >= beta) break;
+        }
+        return best;
+    }
+
+    // Negamax with alpha-beta, TT, null move, LMR.
+    _recFindBestEval(depth, alpha, beta, timeLimitMs, startTime, allowNull=true, allowLmr=true) {
+        if (this._stop_search) return -Infinity;
+        if ((Date.now() - startTime) > timeLimitMs) { this._stop_search=true; return -Infinity; }
+
+        if (depth === 0) return this._quiesce(alpha, beta, timeLimitMs, startTime);
+
+        const entryDepth = depth;
+        const ttKey = `${this._toString()}|${this.whitesMove}|${this.rkMoved}|${this.enPas[0]}|${this.enPas[1]}`;
+        let ttMove = null;
+        if (this._ttable.has(ttKey)) {
+            const entry = this._ttable.get(ttKey);
+            if (entry[0] >= entryDepth) { this.lookUps++; return entry[1]; }
+            ttMove = entry[2] || null;
+        }
+
+        let bestEval = -Infinity;
+        const remaining = depth - 1;
+        let bestMove = null;
+
+        // Null move pruning (before getLegalMoves to skip the expensive call when pruning)
+        const R = 2;
+        if (allowNull && remaining > R && !this._kingChecked(this.whitesMove) && this.nonPawnCount > 4) {
+            const oldEnPas = this.enPas.slice();
+            this.enPas = [-1, -1];
+            this.whitesMove = !this.whitesMove;
+            const nullScore = -this._recFindBestEval(remaining - R, -beta, -beta+1, timeLimitMs, startTime, false);
+            this.whitesMove = !this.whitesMove;
+            this.enPas = oldEnPas;
+            if (!this._stop_search && nullScore >= beta) return beta;
+        }
+
+        let moves = this.getLegalMoves();
+        if (moves.length === 0) {
+            return this._kingChecked(this.whitesMove) ? bestEval : 0;
+        }
+
+        if (remaining !== 0) {
+            moves = this._sortMoves(moves, entryDepth, ttMove);
+        } else {
+            // Stand-pat at frontier (remaining==0 = depth==1)
+            const standPat = this.whitesMove ? this.evaluatePosition() : -this.evaluatePosition();
+            this.i++;
+            if (standPat >= beta) return standPat;
+            if (standPat > alpha) alpha = standPat;
+            bestEval = Math.max(bestEval, standPat);
+            moves = moves.filter(m => {
+                if (m.getAttacking()!==1) return false;
+                const vv=_PVALUES[this.board[m.getX2()+m.getY2()*8]];
+                const av=_PVALUES[this.board[m.getX1()+m.getY1()*8]];
+                return vv===0 || vv*3>=av;
+            });
+            if (!moves.length) return bestEval;
+        }
+
+        for (let moveIdx=0; moveIdx<moves.length; moveIdx++) {
+            const move = moves[moveIdx];
+            const rec = this._saveState(move);
+            this.makeMove(move);
+
+            const cur = this._toString();
+            let score;
+            if ((this.boardHistoryCounts[cur] || 0) > 2) {
+                score = 0;
+            } else if (allowLmr && moveIdx>=5 && remaining>=3 && move.getAttacking()===0
+                        && !this._stop_search && !this._kingChecked(this.whitesMove)) {
+                // LMR: reduced probe
+                score = -this._recFindBestEval(remaining-1, -alpha-1, -alpha, timeLimitMs, startTime, false, false);
+                if (!this._stop_search && score > alpha)
+                    score = -this._recFindBestEval(remaining, -beta, -alpha, timeLimitMs, startTime);
+            } else {
+                score = -this._recFindBestEval(remaining, -beta, -alpha, timeLimitMs, startTime);
+            }
+            this._undoMove(rec);
+
+            if (this._stop_search) break;
+            if (score > bestEval) { bestEval=score; bestMove=move; }
+            if (score > alpha) alpha = score;
+            if (alpha >= beta) {
+                this.prunings++;
+                if (move.getAttacking()===0) {
+                    const from=move.getX1()*8+move.getY1(), to=move.getX2()*8+move.getY2();
+                    this._history[from + to*64] = (this._history[from + to*64] || 0) + entryDepth*entryDepth;
+                    if (!move.equals(this._killers[entryDepth][0])) {
+                        this._killers[entryDepth][1] = this._killers[entryDepth][0];
+                        this._killers[entryDepth][0] = move;
+                    }
+                }
+                this._ttable.set(ttKey, [entryDepth, bestEval, move]);
+                return bestEval;
+            }
+        }
+
+        if (!this._stop_search) this._ttable.set(ttKey, [entryDepth, bestEval, bestMove]);
+        return bestEval;
+    }
+
+    // Root search: returns [bestMove, bestEval, sortedMoves]
+    findBestMove(depthLimit, timeLimitMs, startTime, moves = []) {
+        this._stop_search = false;
+        const alpha = -Infinity, beta = Infinity;
+        if (moves.length === 0) {
+            return [null, this._kingChecked(this.whitesMove) ? -Infinity : 0, []];
+        }
+        const scores = [];
+        let bestMove = null, bestScore = -Infinity;
+        for (const move of moves) {
+            const rec = this._saveState(move);
+            this.makeMove(move);
+            const cur = this._toString();
+            let score;
+            if ((this.boardHistoryCounts[cur] || 0) > 2) {
+                score = 0; scores.push(score);
+            } else {
+                score = -this._recFindBestEval(depthLimit, -beta, -alpha, timeLimitMs, startTime);
+                if (!this._stop_search) scores.push(score);
+            }
+            this._undoMove(rec);
+            if (this._stop_search) break;
+            if (score > bestScore) { bestScore=score; bestMove=move; }
+        }
+        if (scores.length === 0) return [moves[0], -Infinity, moves];
+
+        const padded = [...scores, ...Array(moves.length - scores.length).fill(-Infinity)];
+        const sorted = moves.map((m,i)=>[m,padded[i]]).sort((a,b)=>b[1]-a[1]).map(p=>p[0]);
+        return [bestMove, bestScore, sorted];
+    }
+
+    // Main entry point: iterative deepening search. Returns [move, depth, elapsed_s, whiteEval]
+    botMove(timeLimit = 1) {
+        const timeLimitMs = timeLimit * 1000;
+        const startTime   = Date.now();
+        let d = 2;
+        this.i=0; this.prunings=0; this.lookUps=0;
+        this._history  = new Int32Array(64*64);
+        this._killers  = Array.from({length:128}, ()=>[null,null]);
+        this._ttable   = new LimitedSizeDict(100_000);
+        this._stop_search = false;
+
+        let prevMove = null, prevEval = -Infinity;
+        let moves = this.getLegalMoves();
+
+        while (true) {
+            this._ttable = new LimitedSizeDict(100_000);
+            let [move, eval_, newMoves] = this.findBestMove(d, timeLimitMs, startTime, moves);
+            d++;
+            if ((Date.now() - startTime) > timeLimitMs) {
+                if (this._stop_search && prevMove !== null) { eval_=prevEval; move=prevMove; }
+                moves = newMoves;
+                break;
+            }
+            prevMove=move; prevEval=eval_;
+            moves = newMoves;
+            if (d > 99) break;
+        }
+        this.depth = d;
+
+        const elapsed = (Date.now() - startTime) / 1000;
+        this.avgMoveTime = this.avgMoveTime * 0.9 + elapsed * 0.1;
+
+        if (prevMove !== null) this.makeMove(prevMove, true);
+
+        const whiteEval = this.whitesMove ? -prevEval : prevEval;
+        this.evaluation = prevEval;
+        return [prevMove, this.depth, elapsed, whiteEval];
+    }
+}
+
+// ── Exports ───────────────────────────────────────────────────────────────────
+const _engineExports = { ChessEngine };
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = _engineExports;
+} else {
+    Object.assign(typeof globalThis !== 'undefined' ? globalThis : self, _engineExports);
+}
