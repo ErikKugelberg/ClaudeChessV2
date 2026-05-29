@@ -952,16 +952,16 @@ class ChessEngine {
             this._ttable = new LimitedSizeDict(100_000);
             let [move, eval_, newMoves] = this.findBestMove(d, timeLimitMs, startTime, moves);
             d++;
-            if ((Date.now() - startTime) > timeLimitMs) {
-                if (this._stop_search && prevMove !== null) { eval_=prevEval; move=prevMove; }
-                moves = newMoves;
-                break;
-            }
-            prevMove=move; prevEval=eval_;
+            // Keep previous complete iteration if this one was interrupted mid-search;
+            // otherwise always take the current result (even from a partial first iteration).
+            if (!this._stop_search || prevMove === null) { prevMove=move; prevEval=eval_; }
             moves = newMoves;
-            if (d > 99) break;
+            if ((Date.now() - startTime) > timeLimitMs || d > 99) break;
         }
         this.depth = d;
+
+        // Last-resort: if every iteration timed out before finishing one root move, play any legal move.
+        if (prevMove === null && moves.length > 0) prevMove = moves[0];
 
         const elapsed = (Date.now() - startTime) / 1000;
         this.avgMoveTime = this.avgMoveTime * 0.9 + elapsed * 0.1;
